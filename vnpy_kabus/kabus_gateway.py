@@ -361,8 +361,8 @@ class KabusRestApi(RestClient):
         # details - true:追加情報を出力する、false:追加情報を出力しない
         # state - 1:待機（発注待機）、2:処理中（発注送信中）、3:処理済（発注済・訂正済）、4:訂正取消送信中、5:終了（発注エラー・取消済・全約定・失効・期限切れ）
         # updtime yyyyMMddHHmmss （例：20250207010000）指定された更新日時以降（指定日時含む）に更新された注文のみレスポンスします。
-        # symbol - 銘柄コード（例：160030023）日経225マイクロ先物 25/03
-        params = {'product': 3, 'details': 'false', 'symbol': '160030023'}
+        # symbol - 銘柄コード（例：160060023）日経225マイクロ先物 25/06
+        params = {'product': 3, 'details': 'false', 'symbol': '160060023'}
         if self.gateway.order_query_time is not None:
             params['updtime'] = self.gateway.order_query_time
         # 3秒前の時間を取得, 作为下一次查询的时间起点
@@ -380,9 +380,9 @@ class KabusRestApi(RestClient):
 
     def query_contract(self) -> None:
         """查询合约信息"""
-        # 'http://localhost:18080/kabusapi/symbol/160030023@2?addinfo=false'
+        # 'http://localhost:18080/kabusapi/symbol/160060023@2?addinfo=false'
         params = {'addinfo': 'false'}
-        symbol = '160030023'
+        symbol = '160060023'
         market = '2' # 1: 東証、3: 名証、5: 福証、6: 札証、2: 日通し、23: 日中、24: 夜間
 
         path: str = f"/kabusapi/symbol/{symbol}@{market}?{urlencode(params)}"
@@ -396,7 +396,7 @@ class KabusRestApi(RestClient):
 
     def register_symbol(self):
         """订阅行情"""
-        symbol = '160030023'
+        symbol = '160060023'
         market = '2' # 1: 東証、3: 名証、5: 福証、6: 札証、2: 日通し、23: 日中、24: 夜間
         data = {'Symbols':
             [
@@ -852,7 +852,7 @@ class KabusWebsocketApi(WebsocketClient):
     # Database历史Tick数据模拟实盘行情
     def load_data(self) -> None:
         data: List[TickData] = self.load_tick_data(
-            symbol='160030023',
+            symbol='160060023',
             exchange=Exchange.JPX,
             start=datetime(2025, 2, 6),
             end=datetime(2025, 2, 7)
