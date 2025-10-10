@@ -19,7 +19,7 @@ from vnpy.trader.constant import (
     Interval,
     Status,
     Direction,
-    Exchange, Offset
+    Exchange, Offset, OptionType
 )
 from vnpy.trader.object import (
     AccountData,
@@ -41,11 +41,26 @@ from vnpy.trader.event import EVENT_TIMER
 from vnpy_websocket import WebsocketClient
 from vnpy_rest import Request, RestClient
 
-
-
 # 中国时区
 CHINA_TZ = pytz.timezone("Asia/Shanghai")
 JAPAN_TZ = pytz.timezone("Asia/Tokyo")
+
+KBS_PutOptions  = 1
+KBS_CallOptions = 2
+
+# 限月指定
+NK225_CODE                = "NK225micro"  # 日经225mini
+NK225_MONTH               = 2506  # future
+
+NK225_OP_CODE             = "NK225miniop"  # 日经225miniop
+NK225_OP_MONTH            = 2506  # option
+
+NK225_WEEKLY_OP_CODE      = "NK225weeklyop"  # 日经225weekly
+NK225_WEEKLY_OP_MONTH     = 2506  # option weekly
+NK225_WEEKLY_OP_WEEK      = 3       # option weekly
+
+NK225_OP_STRIKE_PRICE_MIN = 34500
+NK225_OP_STRIKE_PRICE_MAX = 39500
 
 # REST API地址
 REST_HOST: str = "http://localhost:18080"
@@ -87,6 +102,12 @@ CASHMARGIN_KBS2VT = {v: k for k, v in CASHMARGIN_VT2KBS.items()}
 
 # 商品类型映射
 
+# 期权类型映射
+OPTIONTYPE_KBS2VT: dict[int, OptionType] = {
+    KBS_CallOptions: OptionType.CALL,
+    KBS_PutOptions: OptionType.PUT
+}
+
 # 窗口长度映射
 WINDOW_VT2KBS = {
     Interval.MINUTE: 60,
@@ -105,14 +126,23 @@ LMIMIT_VT2KBS = {
     Interval.WEEKLY: 1400
 }
 
-# 合约数据全局缓存字典
-symbol_contract_map: Dict[str, ContractData] = {}
-
 
 # 鉴权类型
 class Security(Enum):
     NONE: int = 0
     SIGNED: int = 1
+
+# 合约数据全局缓存字典
+symbol_contract_map: dict[str, ContractData] = {}
+
+# 銘柄コード数据全局缓存字典
+SYMBOL_VT2KBS: dict[str, str] = {}
+
+def symbol_kbs2vt(d, symbol_kbs):
+    keys = [k for k, v in d.items() if v == symbol_kbs]
+    if keys:
+        return keys[0]
+    return None
 
 
 class KabusGateway(BaseGateway):
@@ -236,9 +266,34 @@ class KabusRestApi(RestClient):
         self.order_count_lock: Lock = Lock()
         self.connect_time: int = 0
 
+        self.contract_inited: bool = False
+        self.symbol_registered: bool = False
+
         self.active: bool = False
         self.thread: threading.Thread = None
         self.lock: threading.Lock = threading.Lock()
+
+        self.trading_future_symbol: str = "nk-YYYYMM"
+        self.symbol_settings: list = [
+            f"{NK225_CODE}-{NK225_MONTH}"
+        ]
+        self.create_option_symbol_settings(
+            NK225_OP_CODE,
+            NK225_OP_MONTH,
+            NK225_OP_STRIKE_PRICE_MIN,
+            NK225_OP_STRIKE_PRICE_MAX
+        )
+        self.thread_symbol: threading.Thread = None
+
+    def create_option_symbol_settings(self, symbol_code: str, month: int, strike_min: int,  strike_max: int) -> None:
+        """生成option symbol settings"""
+        # 生成option symbol settings
+        for strike_price in range(strike_min, strike_max + 1, 250):
+            symbol_setting = f"{symbol_code}-{month}-P-{strike_price}"
+            self.symbol_settings.append(symbol_setting)
+            symbol_setting = f"{symbol_code}-{month}-C-{strike_price}"
+            self.symbol_settings.append(symbol_setting)
+
 
     def sign(self, request: Request) -> Request:
         """生成FTX签名"""
@@ -266,12 +321,12 @@ class KabusRestApi(RestClient):
         self.init(REST_HOST)
         self.start()
 
-        self.gateway.write_log("REST API启动成功")
+        self.gateway.write_log("[OK] REST API启动")
 
         self.query_token()
 
     def query_token(self) -> None:
-        """Token查询"""
+        """トークン発行"""
         data: dict = {"APIPassword": self.key}
 
         path: str = "/kabusapi/token"
@@ -281,34 +336,121 @@ class KabusRestApi(RestClient):
             path=path,
             callback=self.on_query_token,
             data=data,
-            on_failed = self.on_failed
+            on_failed = self.on_query_token_failed
         )
 
     def on_query_token(self, data: dict, request: Request) -> None:
-        """Token查询回报"""
+        """トークン発行"""
         print(f"on_query_token: {data}")
         if data["ResultCode"] == 0:
             self.token = data["Token"]
-            self.gateway.write_log("Token查询成功")
+            self.gateway.write_log("[OK] トークン発行")
+
+            self.unregister_all()
 
             self.query_account()
+
             self.query_position()
-            self.query_contract()
-            self.register_symbol()
 
             # Start the thread to process incoming data
             self.active: bool = True
-            self.thread = threading.Thread(target=self.run_query_thread)
+            self.thread_symbol = threading.Thread(target=self.run_query_symbol_thread)
+            self.thread_symbol.start()
+            self.thread = threading.Thread(target=self.run_query_order_thread)
             self.thread.start()
         else:
-            self.gateway.write_log("Token查询失败")
+            self.gateway.write_log("[NG] トークン発行")
 
+    def unregister_all(self):
+        """全銘柄登録解除"""
+        path: str = "/kabusapi/unregister/all"
 
-    def run_query_thread(self) -> None:
+        self.add_request(
+            method="PUT",
+            path=path,
+            callback=self.on_unregister_all,
+            on_failed=self.on_unregister_all_failed
+        )
+
+    def on_query_token_failed(self, status_code: str, request: Request):
+        """トークン発行失敗"""
+        msg = f"[NG] トークン発行, 状态码：{status_code}，信息：{request.response.text}"
+        self.gateway.write_log(msg)
+
+    def query_symbol(self, symbol_setting: str) -> None:
+    # def query_symbol(self, code: str, month: int, op_weekly: int=None, op_type: str=None, op_strike_price: int=None) -> None:
+        """銘柄コード取得"""
+        # 'http://localhost:18080/kabusapi/symbolname/{future|option|minioptionweekly}'
+        # OptionCode - NK225op:日経225オプション、NK225miniop:日経225ミニオプション
+        # PutOrCall - P: PUT, C: CALL
+        # Result
+        # 200 OK
+        # {'Symbol': '130195526', 'SymbolName': '日経平均ミニオプション 25/05 2週限 プット 35500'}
+        # HTTP Error 400: Bad Request
+        # {'Code': 4002001, 'Message': '銘柄が見つからない'}
+        # split the string into parts
+        parts = symbol_setting.split("-")
+        code = parts[0]  # NK225micro
+        month = int(parts[1])  # 2506
+
+        params = {'DerivMonth': 200000 + month} # 202506
+        if code in ['NK225', 'NK225mini', 'NK225micro']:
+            params['FutureCode']  = code
+            cmd = 'future'
+            symbol = f"nk-{month}"
+            self.trading_future_symbol = symbol
+        elif code in ['NK225op', 'NK225miniop']:
+            op_type               = parts[2]   # P
+            op_strike_price       = int(parts[3])
+            params['OptionCode']  = code
+            params['PutOrCall']   = op_type
+            params['StrikePrice'] = op_strike_price
+            cmd = 'option'
+            # symbol = f"nk-{month}-{op_type}-{op_strike_price}"
+        elif code == 'NK225weeklyop':
+            op_weekly       = int(parts[2])  # 3: 3週限
+            op_type         = parts[3]       # P
+            op_strike_price = int(parts[4])
+            params['DerivWeekly'] = op_weekly
+            params['PutOrCall']   = op_type
+            params['StrikePrice'] = op_strike_price
+            cmd = 'minioptionweekly'
+            # symbol = f"nk-{month}-{op_weekly}-{op_type}-{op_strike_price}"
+
+        path: str = f"/kabusapi/symbolname/{cmd}?{urlencode(params)}"
+
+        self.add_request(
+            method="GET",
+            path=path,
+            callback=self.on_query_symbol,
+            on_failed=self.on_query_symbol_failed,
+            extra=symbol_setting
+        )
+
+    def run_query_symbol_thread(self) -> None:
         """Function run in the thread"""
-        self.gateway.write_log("未成交委托查询线程启动")
+        self.gateway.write_log("[OK] 銘柄コード取得スレッド起動")
+        symbol_setting = self.symbol_settings.pop(0)
+        self.query_symbol(symbol_setting)
+        while self.active and self.symbol_settings:
+            time.sleep(0.2)
+            if not self.symbol_registered:
+                continue
+            self.symbol_registered = False
+            symbol_setting = self.symbol_settings.pop(0)
+            self.query_symbol(symbol_setting)
+        self.contract_inited = True
+        self.gateway.write_log("[OK] 銘柄コード取得スレッド終了")
+
+
+    def run_query_order_thread(self) -> None:
+        """Function run in the thread"""
+        self.gateway.write_log("[OK] 注文約定照会処理起動")
         start = datetime.now()
         while self.active:
+            time.sleep(0.2) # 0.2s  5件/秒
+            if not self.contract_inited:
+                continue
             self.query_order()      # 未成交委托查询のレスポンスは、5回/秒
             # self.query_account()      # 取引余力（先物）のレスポンスは、5回/秒
             # 発注APIは5件/秒、取引余力APIや情報API、銘柄登録APIは10件/秒, PUSH間引き間隔は400ms
@@ -316,8 +458,7 @@ class KabusRestApi(RestClient):
             if (end - start).seconds >= 1.6:
                 self.query_position() # 持仓查询のレスポンスは、1回/秒
                 start = end
-            time.sleep(0.2) # 0.2s  5件/秒
-        self.gateway.write_log("未成交委托查询线程结束")
+        self.gateway.write_log("[OK] 注文約定照会処理終了")
 
     def stop_query_order(self) -> None:
         """Stop query_order"""
@@ -327,6 +468,9 @@ class KabusRestApi(RestClient):
 
     def join_query_order(self) -> None:
         """Join to wait the thread exit loop"""
+        if self.thread_symbol and self.thread_symbol.is_alive():
+            self.thread_symbol.join()
+        self.thread_symbol = None
         if self.thread and self.thread.is_alive():
             self.thread.join()
         self.thread = None
@@ -344,7 +488,7 @@ class KabusRestApi(RestClient):
         )
 
     def query_position(self) -> None:
-        """查询持仓"""
+        """残高照会"""
         path: str = "/kabusapi/positions"
 
         self.add_request(
@@ -355,14 +499,19 @@ class KabusRestApi(RestClient):
         )
 
     def query_order(self) -> None:
-        """查询未成交委托"""
+        """注文約定照会"""
         # 'http://localhost:18080/kabusapi/orders?product=3&state=5'
         # product - 0:すべて、1:現物、2:信用、3:先物、4:OP
         # details - true:追加情報を出力する、false:追加情報を出力しない
         # state - 1:待機（発注待機）、2:処理中（発注送信中）、3:処理済（発注済・訂正済）、4:訂正取消送信中、5:終了（発注エラー・取消済・全約定・失効・期限切れ）
         # updtime yyyyMMddHHmmss （例：20250207010000）指定された更新日時以降（指定日時含む）に更新された注文のみレスポンスします。
         # symbol - 銘柄コード（例：160060023）日経225マイクロ先物 25/06
-        params = {'product': 3, 'details': 'false', 'symbol': '160060023'}
+        symbol_ksb = SYMBOL_VT2KBS.get(self.trading_future_symbol, None)
+        if symbol_ksb is None:
+            self.gateway.write_log(f"[NG] 注文約定照会 銘柄コード変換：{self.trading_future_symbol}")
+            return
+
+        params = {'product': 3, 'details': 'false', 'symbol': symbol_ksb}
         if self.gateway.order_query_time is not None:
             params['updtime'] = self.gateway.order_query_time
         # 3秒前の時間を取得, 作为下一次查询的时间起点
@@ -378,29 +527,39 @@ class KabusRestApi(RestClient):
             extra=query_time
         )
 
-    def query_contract(self) -> None:
-        """查询合约信息"""
+    def query_contract(self, symbol: str) -> None:
+        """銘柄情報取得"""
         # 'http://localhost:18080/kabusapi/symbol/160060023@2?addinfo=false'
+        symbol_ksb = SYMBOL_VT2KBS.get(symbol, None)
+        if symbol_ksb is None:
+            self.gateway.write_log(f"[NG] 銘柄情報取得 銘柄コード変換：{symbol}")
+            return
+
         params = {'addinfo': 'false'}
-        symbol = '160060023'
         market = '2' # 1: 東証、3: 名証、5: 福証、6: 札証、2: 日通し、23: 日中、24: 夜間
 
-        path: str = f"/kabusapi/symbol/{symbol}@{market}?{urlencode(params)}"
+        path: str = f"/kabusapi/symbol/{symbol_ksb}@{market}?{urlencode(params)}"
 
         self.add_request(
             method="GET",
             path=path,
             callback=self.on_query_contract,
-            on_failed=self.on_failed
+            on_failed=self.on_query_contract_failed,
+            extra=symbol
         )
 
-    def register_symbol(self):
-        """订阅行情"""
-        symbol = '160060023'
+    def register_symbol(self, symbol: str):
+        """Tickデータ受信登録"""
+        symbol_ksb = SYMBOL_VT2KBS.get(symbol, None)
+        if symbol_ksb is None:
+            self.gateway.write_log(f"[NG] Tickデータ受信登録 銘柄コード変換：{symbol}")
+            return
+
+        # symbol = '160060023'
         market = '2' # 1: 東証、3: 名証、5: 福証、6: 札証、2: 日通し、23: 日中、24: 夜間
         data = {'Symbols':
             [
-                {'Symbol': symbol, 'Exchange': market}
+                {'Symbol': symbol_ksb, 'Exchange': market}
             ]}
 
         path: str = "/kabusapi/register"
@@ -410,7 +569,8 @@ class KabusRestApi(RestClient):
             path=path,
             callback=self.on_register_symbol,
             data=data,
-            on_failed=self.on_register_failed
+            on_failed=self.on_register_failed,
+            extra=symbol
         )
 
     def _new_order_id(self) -> int:
@@ -426,6 +586,10 @@ class KabusRestApi(RestClient):
         # 秒間リクエスト上限: 発注系リクエスト=5件/秒、情報系リクエスト=10件/秒
         # リクエストをかけリスポンスを受けるまで100～150msec程度かかる
         # 取引システム一件当たりの処理時間は、約１０ｍｓ～５０ｍｓ程度
+        symbol_ksb = SYMBOL_VT2KBS.get(req.symbol, None)
+        if symbol_ksb is None:
+            self.gateway.write_log(f"[NG] 委托下单 銘柄コード変換：{req.symbo}")
+            return
 
         # 生成本地委托号
         orderid: str = str(self.connect_time + self._new_order_id())
@@ -438,7 +602,7 @@ class KabusRestApi(RestClient):
         self.gateway.on_order(order)
 
         data: dict = {
-            "Symbol": req.symbol,
+            "Symbol": symbol_ksb,
             "Exchange": 2, # 2: 日通し、23: 日中、24: 夜間、32: SOR日通し、33: SOR日中、34: SOR夜間
             "TradeType": OFFSET_VT2KBS[req.offset], # 1: 新規、2: 返済
             "TimeInForce": 1, # 1: FAS(（Fill and Store）)、2: FAK(Fill and Kill)、3: FOK(Fill or Kill). FASは、部分約定
@@ -492,7 +656,7 @@ class KabusRestApi(RestClient):
         # 取得委托号对应的KBS订单号
         kbs_orderid = self.gateway.orderid_kbs_orderid_map.get(req.orderid, None)
         if kbs_orderid is None:
-            self.gateway.write_log(f"找不到委托号对应的KBS订单号：{req.orderid}")
+            self.gateway.write_log(f"[NG] 找不到委托号对应的KBS订单号：{req.orderid}")
             return
 
         data: dict = {"OrderID": kbs_orderid}
@@ -509,6 +673,47 @@ class KabusRestApi(RestClient):
             extra=order
         )
 
+    def on_unregister_all(self, status_code: str, request: Request) -> None:
+        """全銘柄登録解除成功"""
+        self.gateway.write_log("[OK] 全銘柄登録解除")
+
+    def on_unregister_all_failed(self, status_code: str, request: Request) -> None:
+        """全銘柄登録解除失敗"""
+        msg = f"[NG] 全銘柄登録解除，状态码：{status_code}，信息：{request.response.text}"
+        self.gateway.write_log(msg)
+
+
+    def get_symbol_from_setting(self, symbol_setting: str) -> str:
+        """从symbol_command中获取symbol"""
+        parts = symbol_setting.split("-")
+        parts[0] = "nk"
+        # partsを結合してsymbolを作成
+        symbol = "-".join(parts)
+        return symbol
+
+    def on_query_symbol(self, data: dict, request: Request) -> None:
+        """銘柄コード取得成功"""
+        print(f"on_query_symbol: {data}")
+        symbol_kbs = data["Symbol"]
+        symbol_setting = request.extra
+        symbol = self.get_symbol_from_setting(symbol_setting)
+        SYMBOL_VT2KBS[symbol] = symbol_kbs
+        self.gateway.write_log("[OK]  銘柄コード取得: " + symbol + " (" + symbol_kbs + ")")
+        # 銘柄情報取得
+        time.sleep(0.2)
+        self.query_contract(symbol)
+
+
+    def on_query_symbol_failed(self, status_code: str, request: Request):
+        """銘柄コード取得失敗"""
+        symbol_setting = request.extra
+        msg = f"[NG] 銘柄コード取得: {symbol_setting}，状态码：{status_code}，信息：{request.response.text}"
+        self.gateway.write_log(msg)
+        # retry query symbol
+        time.sleep(0.2)
+        self.query_symbol(symbol_setting)
+
+
     def on_query_account(self, data: dict, request: Request) -> None:
         """资金查询回报"""
         print(f"on_query_account: {data}")
@@ -522,15 +727,21 @@ class KabusRestApi(RestClient):
 
         if account.balance:
             self.gateway.on_account(account)
-        self.gateway.write_log("账户资金查询成功")
+        self.gateway.write_log("[OK] 账户资金查询")
 
     def on_query_position(self, data: dict, request: Request) -> None:
-        """持仓查询回报"""
+        """残高照会成功"""
         # print(f"on_query_position: {data}")
         for d in data:
             pnl = d['ProfitLoss'] if d['ProfitLoss'] is not None else 0
+            symbol_kbs = d["Symbol"]
+            symbol = symbol_kbs2vt(SYMBOL_VT2KBS, symbol_kbs)
+            if symbol is None:
+                self.gateway.write_log(f"[NG] 残高照会 銘柄コード変換：{symbol_kbs}")
+                continue
+
             position: PositionData = PositionData(
-                symbol=d["Symbol"],
+                symbol=symbol,
                 exchange=Exchange.JPX,
                 direction=DIRECTION_KBS2VT[d["Side"]],  # 売買区分（1:売、2:買）
                 volume=d['LeavesQty'],  # 残数量（保有数量）
@@ -544,12 +755,12 @@ class KabusRestApi(RestClient):
         # self.gateway.write_log("持仓信息查询成功")
 
     def on_position_failed(self, status_code: str, request: Request) -> None:
-        """持仓查询失败回报"""
-        msg = f"持仓查询失败，状态码：{status_code}，信息：{request.response.text}"
+        """残高照会"""
+        msg = f"[NG] 残高照会，状态码：{status_code}，信息：{request.response.text}"
         self.gateway.write_log(msg)
 
     def on_query_order(self, data: dict, request: Request) -> None:
-        """未成交委托查询回报"""
+        """注文約定照会"""
         self.gateway.order_query_time = request.extra
         for d in data:
             # print(f"order: {d}")
@@ -583,9 +794,15 @@ class KabusRestApi(RestClient):
                 self.gateway.orderid_kbs_orderid_map[orderid] = kbs_orderid
                 self.gateway.kbs_orderid_orderid_map[kbs_orderid] = orderid
 
+            symbol_kbs = d["Symbol"]
+            symbol = symbol_kbs2vt(SYMBOL_VT2KBS, symbol_kbs)
+            if symbol is None:
+                self.gateway.write_log(f"[NG] 注文約定照会 銘柄コード変換：{symbol_kbs}")
+                continue
+
             order: OrderData = OrderData(
                 orderid=orderid,
-                symbol=d["Symbol"],
+                symbol=symbol,
                 exchange=Exchange.JPX,
                 price=float(d["Price"]),
                 volume=float(d["OrderQty"]),
@@ -622,15 +839,16 @@ class KabusRestApi(RestClient):
         # self.gateway.write_log("委托信息查询成功")
 
     def on_query_order_failed(self, status_code: str, request: Request):
-        """委托信息查询报错回报"""
-        msg = f"委托信息查询失败，状态码：{status_code}，信息：{request.response.text}"
+        """注文約定照会"""
+        msg = f"[NG] 注文約定照会，状态码：{status_code}，信息：{request.response.text}"
         self.gateway.write_log(msg)
 
     def on_query_contract(self, data: dict, request: Request):
-        """合约信息查询回报"""
+        """銘柄情報取得成功"""
         print(f"on_query_contract: {data}")
+        symbol = request.extra
         contract: ContractData = ContractData(
-            symbol=data["Symbol"],
+            symbol=symbol,
             exchange=Exchange.JPX,
             name=data["SymbolName"],
             pricetick=5.0,
@@ -641,24 +859,70 @@ class KabusRestApi(RestClient):
             history_data=False,
             gateway_name=self.gateway_name,
         )
+
+        # 期权相关
+        if data.get("StrikePrice", None) is not None:
+            product_id   = "nk_o"              # 'nk_o'
+            deriv_month  = data["DerivMonth"]  # '2025/06'
+            deriv_month  = deriv_month[2:4] + deriv_month[5:7]   # '2506'
+            deriv_weekly = data.get("DerivWeekly", None)
+            # 获取期权标的
+            underlyer    = f"nk-{deriv_month}"                   # nk-2506
+            # 期权周限月
+            # if deriv_weekly is not None:
+            #     underlyer = f"{underlyer}-{deriv_weekly}"        # nk-2505-3
+            contract.product = Product.OPTION                    # 期权
+            contract.option_portfolio = product_id               # ProductID:         nk_o            # (portfolio)
+            contract.option_underlying = underlyer               # UnderlyingInstrID: nk-2506         # (chain)
+            contract.option_type = OPTIONTYPE_KBS2VT.get(data["PutOrCall"], None)
+            contract.option_strike = data["StrikePrice"]
+            contract.option_index = str(data["StrikePrice"])
+            contract.option_listed = datetime.strptime(str(data["TradeStart"]), "%Y%m%d")
+            contract.option_expiry = datetime.strptime(str(data["TradeEnd"]), "%Y%m%d")
+        else:
+            contract.product = Product.FUTURES
+            deriv_month  = data["DerivMonth"]  # '2025/05'
+            deriv_month  = deriv_month[2:4] + deriv_month[5:7]   # '2506'
+            underlyer    = f"nk-{deriv_month}"                   # nk-2506
+            contract.option_underlying = underlyer               # UnderlyingInstrID: nk-2506  # (chain)
+
+
         self.gateway.on_contract(contract)
 
         symbol_contract_map[contract.symbol] = contract
 
-        self.gateway.write_log("合约信息查询成功")
+        self.gateway.write_log("[OK] 銘柄情報取得: " + contract.symbol)
+        # Tickデータ受信登録
+        time.sleep(0.2)
+        self.register_symbol(symbol)
+
+    def on_query_contract_failed(self, status_code: str, request: Request):
+        """銘柄情報取得失敗"""
+        symbol = request.extra
+        msg = f"[NG] 銘柄情報取得: {symbol}，状态码：{status_code}，信息：{request.response.text}"
+        self.gateway.write_log(msg)
+        # retry query contract
+        time.sleep(0.2)
+        self.query_contract(symbol)
 
     def on_register_symbol(self, data: dict, request: Request) -> None:
-        """订阅行情回报"""
-        print(f"on_register_symbol: {data}")
+        """Tickデータ受信登録成功"""
+        print(f"on_register_symbol:")
         for s in data["RegistList"]:
             pprint.pprint(s)
 
-        self.gateway.write_log("订阅行情成功")
+        symbol = request.extra
+        self.gateway.write_log("[OK] Tickデータ受信登録 " + symbol)
+        self.symbol_registered = True
 
     def on_register_failed(self, status_code: str, request: Request) -> None:
-        """订阅行情失败回报"""
-        msg = f"订阅行情失败，状态码：{status_code}，信息：{request.response.text}"
+        """Tickデータ受信登録失敗"""
+        symbol = request.extra
+        msg = f"[NG] Tickデータ受信登録: {symbol}，状态码：{status_code}，信息：{request.response.text}"
         self.gateway.write_log(msg)
+        # retry register symbol
+        time.sleep(0.2)
+        self.register_symbol(symbol)
 
     def on_send_order(self, data: dict, request: Request) -> None:
         """委托下单回报"""
@@ -686,7 +950,7 @@ class KabusRestApi(RestClient):
         order.status = Status.REJECTED
         self.gateway.on_order(order)
 
-        msg: str = f"委托失败，orderid: {order.orderid}, 状态码：{status_code}，信息：{request.response.text}"
+        msg: str = f"[NG] 委托，orderid: {order.orderid}, 状态码：{status_code}，信息：{request.response.text}"
         self.gateway.write_log(msg)
 
     def on_cancel_order(self, data: dict, request: Request) -> None:
@@ -702,17 +966,17 @@ class KabusRestApi(RestClient):
             order = request.extra
 
         kbs_orderid = self.gateway.orderid_kbs_orderid_map.get(order.orderid, None)
-        msg = f"撤单失败，orderid: {order.orderid}, kbs: {kbs_orderid}, 状态码：{status_code}，信息：{request.response.text}"
+        msg = f"[NG] 撤单，orderid: {order.orderid}, kbs: {kbs_orderid}, 状态码：{status_code}，信息：{request.response.text}"
         self.gateway.write_log(msg)
 
     def on_failed(self, status_code: str, request: Request) -> None:
         """失败回报"""
-        msg = f"失败，状态码：{status_code}，信息：{request.response.text}"
+        msg = f"[NG] 状态码：{status_code}，信息：{request.response.text}"
         self.gateway.write_log(msg)
 
     def query_history(self, req: HistoryRequest) -> List[BarData]:
         """查询历史数据"""
-        self.gateway.write_log("KBS不支持历史数据查询")
+        self.gateway.write_log("[NG] KBS不支持历史数据查询")
         history: List[BarData] = []
         return history
 
@@ -748,7 +1012,7 @@ class KabusWebsocketApi(WebsocketClient):
         self.init(WEBSOCKET_HOST)
         self.start()
 
-        self.gateway.write_log("行情Websocket API启动成功")
+        self.gateway.write_log("[OK] 行情Websocket API启动")
 
         # Database历史Tick数据模拟实盘行情
         # self.load_data()
@@ -758,7 +1022,7 @@ class KabusWebsocketApi(WebsocketClient):
 
     def on_connected(self) -> None:
         """连接成功回报"""
-        self.gateway.write_log("行情Websocket API连接刷新")
+        self.gateway.write_log("[OK] 行情Websocket API连接刷新")
 
         self.ping()
 
@@ -768,13 +1032,13 @@ class KabusWebsocketApi(WebsocketClient):
 
     def on_disconnected(self) -> None:
         """"""
-        self.gateway.write_log("行情Websocket 连接断开")
+        self.gateway.write_log("[OK] 行情Websocket 连接断开")
 
 
     def subscribe(self, req: SubscribeRequest) -> None:
         """订阅行情"""
         if req.symbol not in symbol_contract_map:
-            self.gateway.write_log(f"找不到该合约代码{req.symbol}")
+            self.gateway.write_log(f"[NG] 找不到该合约代码{req.symbol}")
             return
 
         if req.vt_symbol in self.subscribed:
@@ -786,7 +1050,7 @@ class KabusWebsocketApi(WebsocketClient):
     def unsubscribe(self, req: SubscribeRequest) -> None:
         """取消订阅行情"""
         if req.symbol not in symbol_contract_map:
-            self.gateway.write_log(f"找不到该合约代码{req.symbol}")
+            self.gateway.write_log(f"[NG] 找不到该合约代码{req.symbol}")
             return
 
         if req.vt_symbol in self.subscribed:
@@ -795,7 +1059,7 @@ class KabusWebsocketApi(WebsocketClient):
     def resubscribe(self, req: SubscribeRequest) -> None:
         """重连后订阅行情"""
         if req.symbol not in symbol_contract_map:
-            self.gateway.write_log(f"找不到该合约代码{req.symbol}")
+            self.gateway.write_log(f"[NG] 找不到该合约代码{req.symbol}")
             return
 
         self.subscribed[req.vt_symbol] = req
@@ -808,9 +1072,16 @@ class KabusWebsocketApi(WebsocketClient):
 
     def on_packet(self, packet: Any) -> None:
         """推送数据回报"""
+        # print(f"on_packet: {packet}")
+        symbol_kbs = packet['Symbol']
+        symbol = symbol_kbs2vt(SYMBOL_VT2KBS, symbol_kbs)
+        if symbol is None:
+            self.gateway.write_log(f"[NG] 推送数据 銘柄コード変換：{symbol_kbs}")
+            return
+
         tick: TickData = TickData(
             gateway_name=self.gateway_name,
-            symbol=packet['Symbol'],
+            symbol=symbol,
             exchange=Exchange.JPX,
             datetime=generate_datetime(packet["CurrentPriceTime"]),
 
@@ -846,6 +1117,12 @@ class KabusWebsocketApi(WebsocketClient):
             bid_price_5 =packet["Buy5"]["Price"],
             bid_volume_5=packet["Buy5"]["Qty"],
         )
+
+        # 过滤还没有收到合约数据前的行情推送
+        contract: ContractData = symbol_contract_map.get(tick.symbol, None)
+        if not contract:
+            return
+
         if tick.last_price:
             self.gateway.on_tick(copy(tick))
 
@@ -876,7 +1153,7 @@ class KabusWebsocketApi(WebsocketClient):
 
     def run_tickdata_thread(self) -> None:
         """Function run in the thread"""
-        self.gateway.write_log("Database历史Tick数据模拟实盘行情线程启动")
+        self.gateway.write_log("[OK] Database历史Tick数据模拟实盘行情线程启动")
         total_size: int = len(self.history_data)
         batch_size: int = max(int(total_size / 10), 1)
         for ix, i in enumerate(range(0, total_size, batch_size)):
@@ -893,7 +1170,7 @@ class KabusWebsocketApi(WebsocketClient):
             if not self.active:
                 break
 
-        self.gateway.write_log("Database历史Tick数据模拟实盘行情线程结束")
+        self.gateway.write_log("[OK] Database历史Tick数据模拟实盘行情线程结束")
 
     def stop_tickdata_thread(self) -> None:
         """Stop tickdata_thread"""
