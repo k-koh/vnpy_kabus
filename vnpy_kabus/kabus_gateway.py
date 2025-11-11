@@ -61,6 +61,7 @@ NK225_WEEKLY_OP_WEEK      = 1       # option weekly
 
 NK225_OP_STRIKE_PRICE_MIN = 45000
 NK225_OP_STRIKE_PRICE_MAX = 55000
+NK225_OP_STRIKE_SCOPE = 8000
 
 # REST API地址
 REST_HOST: str = "http://localhost:18080"
@@ -273,7 +274,11 @@ class KabusRestApi(RestClient):
         self.thread_order: threading.Thread = None
         self.lock: threading.Lock = threading.Lock()
 
-        self.trading_future_symbol: str = "nk-YYYYMM"
+        self.trading_future_symbol: str = "nk-YYMM"
+        self.atm_price: int = 0
+        self.option_board_data: dict = {}
+        self.eris_call_match: dict = {'symbol': None, 'strike': None, 'delta': None, 'diff': float('inf')}
+        self.eris_put_match: dict = {'symbol': None, 'strike': None, 'delta': None, 'diff': float('inf')}
         # 日経225先物・オプション取得リスト
         self.symbol_settings: list = [
             f"{NK225_CODE}-{NK225_MONTH}"
@@ -287,13 +292,24 @@ class KabusRestApi(RestClient):
         # )
         self.thread_symbol: threading.Thread = None
 
-    def create_option_symbol_settings(self, symbol_code: str, month: int, strike_min: int,  strike_max: int) -> None:
+    # def create_option_symbol_settings(self, symbol_code: str, month: int, strike_min: int,  strike_max: int) -> None:
+    #     """生成option symbol settings"""
+    #     # 生成option symbol settings
+    #     for strike_price in range(strike_min, strike_max + 1, 250):
+    #         symbol_setting = f"{symbol_code}-{month}-P-{strike_price}"
+    #         self.symbol_settings.append(symbol_setting)
+    #         symbol_setting = f"{symbol_code}-{month}-C-{strike_price}"
+    #         self.symbol_settings.append(symbol_setting)
+
+    def create_option_symbol_settings(self, symbol_code: str, month: int, atm_price: int, strike_scope: int) -> None:
         """生成option symbol settings"""
-        # 生成option symbol settings
-        for strike_price in range(strike_min, strike_max + 1, 250):
-            symbol_setting = f"{symbol_code}-{month}-P-{strike_price}"
-            self.symbol_settings.append(symbol_setting)
+        # 生成 call option symbol strike_price in range [atm_price, atm_price + strike_scope] with interval 500
+        for strike_price in range(atm_price, atm_price + strike_scope + 1, 500):
             symbol_setting = f"{symbol_code}-{month}-C-{strike_price}"
+            self.symbol_settings.append(symbol_setting)
+        # 生成 put option symbol strike_price in range [atm_price, atm_price - strike_scope] with interval -500
+        for strike_price in range(atm_price, atm_price - strike_scope -1, -500):
+            symbol_setting = f"{symbol_code}-{month}-P-{strike_price}"
             self.symbol_settings.append(symbol_setting)
 
 
@@ -438,13 +454,13 @@ class KabusRestApi(RestClient):
         while self.active:
             time.sleep(0.2)
             # 銘柄コード取得成功まで待機（sleep繰り返し）
-            if not self.symbol_registered:
-                continue
+            # if not self.symbol_registered:
+            #     continue
             if self.symbol_settings:
-                self.symbol_registered = False
+                # self.symbol_registered = False
                 symbol_setting = self.symbol_settings.pop(0)
                 self.query_symbol(symbol_setting)
-        self.contract_inited = True
+        # self.contract_inited = True
         self.gateway.write_log("[OK] 銘柄リスト取得スレッド終了")
 
 
@@ -722,12 +738,12 @@ class KabusRestApi(RestClient):
         symbol_kbs = data["Symbol"]
         symbol = self.get_symbol_from_setting(symbol_setting)
         SYMBOL_VT2KBS[symbol] = symbol_kbs
-        self.gateway.write_log("[OK]  銘柄コード取得: " + symbol_setting + " -> " + symbol + " (" + symbol_kbs + ")")
-        print(f"on_query_symbol: {symbol_setting} -> {symbol} -> {data}")
+        self.gateway.write_log("[OK]  銘柄コード取得: " + symbol_setting + " (" + symbol_kbs + ")")
+        print(f"on_query_symbol: {symbol_setting} {data}")
         # 銘柄情報取得
         time.sleep(0.2)
         self.query_board(symbol)
-        # self.query_contract(symbol)
+        self.query_contract(symbol)
 
 
     def on_query_symbol_failed(self, status_code: int, request: Request):
@@ -875,8 +891,64 @@ class KabusRestApi(RestClient):
     def on_query_board(self, data: dict, request: Request):
         """時価情報・板情報取得成功"""
         print(f"on_query_board: {data}")
-        current_price = data["CurrentPrice"]
-        atm_price = round(current_price / 250) * 250
+        symbol = request.extra
+
+        if not symbol:
+            return
+
+        # Handle future to update ATM price
+        if symbol == self.trading_future_symbol:
+            current_price = data.get("CurrentPrice")
+            if current_price:
+                self.atm_price = round(current_price / 500) * 500
+                self.gateway.write_log(f"ATM {symbol}: {self.atm_price}")
+                self.create_option_symbol_settings(
+                    NK225_OP_CODE,
+                    NK225_OP_MONTH,
+                    self.atm_price,
+                    NK225_OP_STRIKE_SCOPE
+                )
+
+        # Handle options to find call with delta near 0.1
+        parts = symbol.split('-')
+        if len(parts) == 4 and parts[2] == 'C':  # It's a call option, e.g., nk-2512-C-45000
+            delta = data.get("Delta")
+            if delta is not None:
+                diff = abs(delta - 0.1)
+
+                if diff < self.eris_call_match['diff'] and delta >= 0.1:
+                    strike_price = int(parts[3])
+
+                    # OTM call option: strike price > atm price
+                    if 0 < self.atm_price < strike_price:
+                        self.eris_call_match = {
+                            'symbol': symbol,
+                            'strike': strike_price,
+                            'delta': delta,
+                            'diff': diff
+                        }
+                        self.gateway.write_log(
+                            f"Found Call: {symbol}, Delta: {delta}"
+                        )
+
+        # Handle options to find put with delta near -0.1
+        elif len(parts) == 4 and parts[2] == 'P':  # It's a put option, e.g., nk-2512-P-43000
+            delta = data.get("Delta")
+            if delta is not None:
+                diff = abs(delta + 0.1)
+                if diff < self.eris_put_match['diff'] and delta <= -0.1:
+                    strike_price = int(parts[3])
+                    # ITM
+                    if self.atm_price > 0 and strike_price < self.atm_price:
+                        self.eris_put_match = {
+                            'symbol': symbol,
+                            'strike': strike_price,
+                            'delta': delta,
+                            'diff': diff
+                        }
+                        self.gateway.write_log(
+                            f"Found Put: {symbol}, Delta: {delta}"
+                        )
 
 
     def on_query_board_failed(self, status_code: int, request: Request):
@@ -926,7 +998,7 @@ class KabusRestApi(RestClient):
             contract.option_expiry = datetime.strptime(str(data["TradeEnd"]), "%Y%m%d")
         else:
             contract.product = Product.FUTURES
-            deriv_month  = data["DerivMonth"]  # '2025/05'
+            deriv_month  = data["DerivMonth"]  # '2025/06'
             deriv_month  = deriv_month[2:4] + deriv_month[5:7]   # '2506'
             underlyer    = f"nk-{deriv_month}"                   # nk-2506
             contract.option_underlying = underlyer               # UnderlyingInstrID: nk-2506  # (chain)
@@ -1118,49 +1190,59 @@ class KabusWebsocketApi(WebsocketClient):
     def on_packet(self, packet: Any) -> None:
         """推送数据回报"""
         # print(f"on_packet: {packet}")
-        symbol_kbs = packet['Symbol']
+        if not packet or not isinstance(packet, dict):
+            return
+
+        symbol_kbs = packet.get('Symbol')
+        if not symbol_kbs:
+            return
+
         symbol = symbol_kbs2vt(SYMBOL_VT2KBS, symbol_kbs)
         if symbol is None:
             self.gateway.write_log(f"[NG] 推送数据 銘柄コード変換：{symbol_kbs}")
+            return
+
+        current_price_time = packet.get("CurrentPriceTime")
+        if not current_price_time:
             return
 
         tick: TickData = TickData(
             gateway_name=self.gateway_name,
             symbol=symbol,
             exchange=Exchange.JPX,
-            datetime=generate_datetime(packet["CurrentPriceTime"]),
+            datetime=generate_datetime(current_price_time),
 
-            name=packet["SymbolName"],
-            volume=packet["TradingVolume"],
-            turnover=packet["TradingValue"],
-            open_price=packet["OpeningPrice"],
-            high_price=packet["HighPrice"],
-            low_price=packet["LowPrice"],
-            pre_close=packet["PreviousClose"],
-            last_price=packet["CurrentPrice"],
-            last_volume=packet["TradingVolume"],
+            name=packet.get("SymbolName"),
+            volume=packet.get("TradingVolume"),
+            turnover=packet.get("TradingValue"),
+            open_price=packet.get("OpeningPrice"),
+            high_price=packet.get("HighPrice"),
+            low_price=packet.get("LowPrice"),
+            pre_close=packet.get("PreviousClose"),
+            last_price=packet.get("CurrentPrice"),
+            last_volume=packet.get("TradingVolume"),
 
-            ask_price_1 =packet["Sell1"]["Price"],
-            ask_volume_1=packet["Sell1"]["Qty"],
-            ask_price_2 =packet["Sell2"]["Price"],
-            ask_volume_2=packet["Sell2"]["Qty"],
-            ask_price_3 =packet["Sell3"]["Price"],
-            ask_volume_3=packet["Sell3"]["Qty"],
-            ask_price_4 =packet["Sell4"]["Price"],
-            ask_volume_4=packet["Sell4"]["Qty"],
-            ask_price_5 =packet["Sell5"]["Price"],
-            ask_volume_5=packet["Sell5"]["Qty"],
+            ask_price_1=packet.get("Sell1", {}).get("Price"),
+            ask_volume_1=packet.get("Sell1", {}).get("Qty"),
+            ask_price_2=packet.get("Sell2", {}).get("Price"),
+            ask_volume_2=packet.get("Sell2", {}).get("Qty"),
+            ask_price_3=packet.get("Sell3", {}).get("Price"),
+            ask_volume_3=packet.get("Sell3", {}).get("Qty"),
+            ask_price_4=packet.get("Sell4", {}).get("Price"),
+            ask_volume_4=packet.get("Sell4", {}).get("Qty"),
+            ask_price_5=packet.get("Sell5", {}).get("Price"),
+            ask_volume_5=packet.get("Sell5", {}).get("Qty"),
 
-            bid_price_1 =packet["Buy1"]["Price"],
-            bid_volume_1=packet["Buy1"]["Qty"],
-            bid_price_2 =packet["Buy2"]["Price"],
-            bid_volume_2=packet["Buy2"]["Qty"],
-            bid_price_3 =packet["Buy3"]["Price"],
-            bid_volume_3=packet["Buy3"]["Qty"],
-            bid_price_4 =packet["Buy4"]["Price"],
-            bid_volume_4=packet["Buy4"]["Qty"],
-            bid_price_5 =packet["Buy5"]["Price"],
-            bid_volume_5=packet["Buy5"]["Qty"],
+            bid_price_1=packet.get("Buy1", {}).get("Price"),
+            bid_volume_1=packet.get("Buy1", {}).get("Qty"),
+            bid_price_2=packet.get("Buy2", {}).get("Price"),
+            bid_volume_2=packet.get("Buy2", {}).get("Qty"),
+            bid_price_3=packet.get("Buy3", {}).get("Price"),
+            bid_volume_3=packet.get("Buy3", {}).get("Qty"),
+            bid_price_4=packet.get("Buy4", {}).get("Price"),
+            bid_volume_4=packet.get("Buy4", {}).get("Qty"),
+            bid_price_5=packet.get("Buy5", {}).get("Price"),
+            bid_volume_5=packet.get("Buy5", {}).get("Qty"),
         )
 
         # 过滤还没有收到合约数据前的行情推送
