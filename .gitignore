@@ -1,3 +1,4 @@
 vnpy_kabus/kabusapi/
 build/
 vnpy_kabus.egg-info/
+vnpy_kabus/__pycache__/
