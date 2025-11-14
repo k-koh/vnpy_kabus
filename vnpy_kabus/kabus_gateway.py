@@ -277,8 +277,8 @@ class KabusRestApi(RestClient):
         self.trading_future_symbol: str = "nk-YYMM"
         self.atm_price: int = 0
         self.option_board_data: dict = {}
-        self.eris_call_match: dict = {'symbol': None, 'strike': None, 'delta': None, 'diff': float('inf')}
-        self.eris_put_match: dict = {'symbol': None, 'strike': None, 'delta': None, 'diff': float('inf')}
+        self.eris_call_match: dict = {'symbol': None, 'strike': None, 'delta': None, 'diff': float('inf'), 'impv': None}
+        self.eris_put_match: dict = {'symbol': None, 'strike': None, 'delta': None, 'diff': float('inf'), 'impv': None}
         # 日経225先物・オプション取得リスト
         self.symbol_settings: list = [
             f"{NK225_CODE}-{NK225_MONTH}"
@@ -913,6 +913,7 @@ class KabusRestApi(RestClient):
         parts = symbol.split('-')
         if len(parts) == 4 and parts[2] == 'C':  # It's a call option, e.g., nk-2512-C-45000
             delta = data.get("Delta")
+            impv = data.get("ImpliedVolatility")
             if delta is not None:
                 diff = abs(delta - 0.1)
 
@@ -925,15 +926,17 @@ class KabusRestApi(RestClient):
                             'symbol': symbol,
                             'strike': strike_price,
                             'delta': delta,
-                            'diff': diff
+                            'diff': diff,
+                            'impv': impv
                         }
                         self.gateway.write_log(
-                            f"Found Call: {symbol}, Delta: {delta}"
+                            f"Found Call: {symbol}, Delta: {delta}, Impv: {impv}"
                         )
 
         # Handle options to find put with delta near -0.1
         elif len(parts) == 4 and parts[2] == 'P':  # It's a put option, e.g., nk-2512-P-43000
             delta = data.get("Delta")
+            impv = data.get("ImpliedVolatility")
             if delta is not None:
                 diff = abs(delta + 0.1)
                 if diff < self.eris_put_match['diff'] and delta <= -0.1:
@@ -944,10 +947,11 @@ class KabusRestApi(RestClient):
                             'symbol': symbol,
                             'strike': strike_price,
                             'delta': delta,
-                            'diff': diff
+                            'diff': diff,
+                            'impv': impv
                         }
                         self.gateway.write_log(
-                            f"Found Put: {symbol}, Delta: {delta}"
+                            f"Found Put: {symbol}, Delta: {delta}, Impv: {impv}"
                         )
 
 
@@ -1189,7 +1193,7 @@ class KabusWebsocketApi(WebsocketClient):
 
     def on_packet(self, packet: Any) -> None:
         """推送数据回报"""
-        # print(f"on_packet: {packet}")
+        print(f"on_packet: {packet}")
         if not packet or not isinstance(packet, dict):
             return
 
