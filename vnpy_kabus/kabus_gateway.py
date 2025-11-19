@@ -445,6 +445,7 @@ class KabusRestApi(RestClient):
             on_failed=self.on_query_symbol_failed,
             extra=symbol_setting
         )
+        self.gateway.write_log("[__] symbol: " + symbol_setting)
 
     def run_query_symbol_thread(self) -> None:
         """Function run in the thread"""
@@ -567,6 +568,7 @@ class KabusRestApi(RestClient):
             on_failed=self.on_query_board_failed,
             extra=symbol
         )
+        self.gateway.write_log("[__] board: " + symbol)
 
     def query_contract(self, symbol: str) -> None:
         """銘柄情報取得"""
@@ -588,6 +590,7 @@ class KabusRestApi(RestClient):
             on_failed=self.on_query_contract_failed,
             extra=symbol
         )
+        self.gateway.write_log("[__] contract: " + symbol)
 
     def register_symbol(self, symbol: str):
         """Tickデータ受信登録"""
@@ -613,6 +616,7 @@ class KabusRestApi(RestClient):
             on_failed=self.on_register_failed,
             extra=symbol
         )
+        self.gateway.write_log("[__] register: " + symbol)
 
     def _new_order_id(self) -> int:
         """生成本地委托号"""
@@ -738,18 +742,19 @@ class KabusRestApi(RestClient):
         symbol_kbs = data["Symbol"]
         symbol = self.get_symbol_from_setting(symbol_setting)
         SYMBOL_VT2KBS[symbol] = symbol_kbs
-        self.gateway.write_log("[OK]  銘柄コード取得: " + symbol_setting + " (" + symbol_kbs + ")")
+        self.gateway.write_log("[OK] symbol: " + symbol_setting + " (" + symbol_kbs + ")")
         print(f"on_query_symbol: {symbol_setting} {data}")
         # 銘柄情報取得
         time.sleep(0.2)
         self.query_board(symbol)
         self.query_contract(symbol)
+        self.register_symbol(symbol)
 
 
     def on_query_symbol_failed(self, status_code: int, request: Request):
         """銘柄コード取得失敗"""
         symbol_setting = request.extra
-        msg = f"[NG] 銘柄コード取得: {symbol_setting}，状态码：{status_code}，信息：{request.response.text}"
+        msg = f"[NG] symbol: {symbol_setting}，状态码：{status_code}，信息：{request.response.text}"
         self.gateway.write_log(msg)
         # retry query symbol
         time.sleep(0.2)
@@ -805,7 +810,7 @@ class KabusRestApi(RestClient):
 
     def on_query_order(self, data: dict, request: Request) -> None:
         """注文約定照会"""
-        # print(f"on_query_order: {data}")
+        print(f"on_query_order: {data}")
         self.gateway.order_query_time = request.extra
         for d in data:
             # print(f"order: {d}")
@@ -898,10 +903,10 @@ class KabusRestApi(RestClient):
 
         # Handle future to update ATM price
         if symbol == self.trading_future_symbol:
-            current_price = data.get("CurrentPrice")
+            current_price = data.get("CalcPrice")
             if current_price:
                 self.atm_price = round(current_price / 500) * 500
-                self.gateway.write_log(f"ATM {symbol}: {self.atm_price}")
+                self.gateway.write_log(f"[OK] board ATM {symbol}: {current_price} -> {self.atm_price}")
                 self.create_option_symbol_settings(
                     NK225_OP_CODE,
                     NK225_OP_MONTH,
@@ -913,8 +918,9 @@ class KabusRestApi(RestClient):
         parts = symbol.split('-')
         if len(parts) == 4 and parts[2] == 'C':  # It's a call option, e.g., nk-2512-C-45000
             delta = data.get("Delta")
-            impv = data.get("ImpliedVolatility")
-            if delta is not None:
+            impv = data.get("IV")
+            cur_price = data.get("CurrentPrice")
+            if delta is not None and cur_price is not None:
                 diff = abs(delta - 0.1)
 
                 if diff < self.eris_call_match['diff'] and delta >= 0.1:
@@ -930,14 +936,15 @@ class KabusRestApi(RestClient):
                             'impv': impv
                         }
                         self.gateway.write_log(
-                            f"Found Call: {symbol}, Delta: {delta}, Impv: {impv}"
+                            f"[OK] board {symbol}, Delta: {delta}, IV: {impv}"
                         )
 
         # Handle options to find put with delta near -0.1
         elif len(parts) == 4 and parts[2] == 'P':  # It's a put option, e.g., nk-2512-P-43000
             delta = data.get("Delta")
-            impv = data.get("ImpliedVolatility")
-            if delta is not None:
+            impv = data.get("IV")
+            cur_price = data.get("CurrentPrice")
+            if delta is not None and cur_price is not None:
                 diff = abs(delta + 0.1)
                 if diff < self.eris_put_match['diff'] and delta <= -0.1:
                     strike_price = int(parts[3])
@@ -951,14 +958,14 @@ class KabusRestApi(RestClient):
                             'impv': impv
                         }
                         self.gateway.write_log(
-                            f"Found Put: {symbol}, Delta: {delta}, Impv: {impv}"
+                            f"[OK] board {symbol}, Delta: {delta}, IV: {impv}"
                         )
 
 
     def on_query_board_failed(self, status_code: int, request: Request):
         """時価情報・板情報取得失敗"""
         symbol = request.extra
-        msg = f"[NG] 時価情報取得: {symbol}，状态码：{status_code}，信息：{request.response.text}"
+        msg = f"[NG] board: {symbol}，状态码：{status_code}，信息：{request.response.text}"
         self.gateway.write_log(msg)
         # retry query contract
         time.sleep(0.2)
@@ -1012,15 +1019,15 @@ class KabusRestApi(RestClient):
 
         symbol_contract_map[contract.symbol] = contract
 
-        self.gateway.write_log("[OK] 銘柄情報取得: " + contract.symbol)
+        self.gateway.write_log("[OK] contract: " + contract.symbol)
         # Tickデータ受信登録
-        time.sleep(0.2)
-        self.register_symbol(symbol)
+        # time.sleep(0.2)
+        # self.register_symbol(symbol)
 
     def on_query_contract_failed(self, status_code: int, request: Request):
         """銘柄情報取得失敗"""
         symbol = request.extra
-        msg = f"[NG] 銘柄情報取得: {symbol}，状态码：{status_code}，信息：{request.response.text}"
+        msg = f"[NG] contract: {symbol}，状态码：{status_code}，信息：{request.response.text}"
         self.gateway.write_log(msg)
         # retry query contract
         time.sleep(0.2)
@@ -1033,13 +1040,13 @@ class KabusRestApi(RestClient):
             pprint.pprint(s)
 
         symbol = request.extra
-        self.gateway.write_log("[OK] Tickデータ受信登録 " + symbol)
+        self.gateway.write_log("[OK] register " + symbol)
         self.symbol_registered = True
 
     def on_register_failed(self, status_code: int, request: Request) -> None:
         """Tickデータ受信登録失敗"""
         symbol = request.extra
-        msg = f"[NG] Tickデータ受信登録: {symbol}，状态码：{status_code}，信息：{request.response.text}"
+        msg = f"[NG] register: {symbol}，状态码：{status_code}，信息：{request.response.text}"
         self.gateway.write_log(msg)
         # retry register symbol
         time.sleep(0.2)
@@ -1193,7 +1200,7 @@ class KabusWebsocketApi(WebsocketClient):
 
     def on_packet(self, packet: Any) -> None:
         """推送数据回报"""
-        print(f"on_packet: {packet}")
+        # print(f"on_packet: {packet}")
         if not packet or not isinstance(packet, dict):
             return
 
