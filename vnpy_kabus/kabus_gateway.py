@@ -36,7 +36,7 @@ from vnpy.trader.object import (
     HistoryRequest,
     BarData
 )
-from vnpy.trader.event import EVENT_TIMER
+from vnpy.trader.event import EVENT_TIMER, EVENT_ATM
 
 from vnpy_websocket import WebsocketClient
 from vnpy_rest import Request, RestClient
@@ -283,34 +283,37 @@ class KabusRestApi(RestClient):
         self.symbol_settings: list = [
             f"{NK225_CODE}-{NK225_MONTH}"
         ]
-        # 日経225オプション取得リスト作成
-        # self.create_option_symbol_settings(
-        #     NK225_OP_CODE,
-        #     NK225_OP_MONTH,
-        #     NK225_OP_STRIKE_PRICE_MIN,
-        #     NK225_OP_STRIKE_PRICE_MAX
-        # )
+        self.queried_symbol_settings: list = []
         self.thread_symbol: threading.Thread = None
+        self.gateway.event_engine.register(EVENT_ATM, self.process_atm_event)
 
-    # def create_option_symbol_settings(self, symbol_code: str, month: int, strike_min: int,  strike_max: int) -> None:
-    #     """生成option symbol settings"""
-    #     # 生成option symbol settings
-    #     for strike_price in range(strike_min, strike_max + 1, 250):
-    #         symbol_setting = f"{symbol_code}-{month}-P-{strike_price}"
-    #         self.symbol_settings.append(symbol_setting)
-    #         symbol_setting = f"{symbol_code}-{month}-C-{strike_price}"
-    #         self.symbol_settings.append(symbol_setting)
+    def process_atm_event(self, event) -> None:
+        """ATM价格变动事件处理"""
+        atm_price: int = int(float(event.data))
+        self.gateway.write_log(f"[OK] ATM価格: {atm_price}")
+        if self.atm_price != atm_price:
+            self.gateway.write_log(f"[OK] ATM価格変更: {self.atm_price} -> {atm_price}")
+            self.atm_price = atm_price
+            self.create_option_symbol_settings(
+                NK225_OP_CODE,
+                NK225_OP_MONTH,
+                self.atm_price,
+                NK225_OP_STRIKE_SCOPE
+            )
+
 
     def create_option_symbol_settings(self, symbol_code: str, month: int, atm_price: int, strike_scope: int) -> None:
         """生成option symbol settings"""
         # 生成 call option symbol strike_price in range [atm_price, atm_price + strike_scope] with interval 500
-        for strike_price in range(atm_price, atm_price + strike_scope + 1, 500):
+        for strike_price in range(atm_price - 1000, atm_price + strike_scope + 1, 500):
             symbol_setting = f"{symbol_code}-{month}-C-{strike_price}"
-            self.symbol_settings.append(symbol_setting)
+            if symbol_setting not in self.queried_symbol_settings:
+                self.symbol_settings.append(symbol_setting)
         # 生成 put option symbol strike_price in range [atm_price, atm_price - strike_scope] with interval -500
-        for strike_price in range(atm_price, atm_price - strike_scope -1, -500):
+        for strike_price in range(atm_price + 1000, atm_price - strike_scope -1, -500):
             symbol_setting = f"{symbol_code}-{month}-P-{strike_price}"
-            self.symbol_settings.append(symbol_setting)
+            if symbol_setting not in self.queried_symbol_settings:
+                self.symbol_settings.append(symbol_setting)
 
 
     def sign(self, request: Request) -> Request:
@@ -739,6 +742,8 @@ class KabusRestApi(RestClient):
     def on_query_symbol(self, data: dict, request: Request) -> None:
         """銘柄コード取得成功"""
         symbol_setting = request.extra
+        self.queried_symbol_settings.append(symbol_setting)
+
         symbol_kbs = data["Symbol"]
         symbol = self.get_symbol_from_setting(symbol_setting)
         SYMBOL_VT2KBS[symbol] = symbol_kbs
@@ -746,7 +751,7 @@ class KabusRestApi(RestClient):
         print(f"on_query_symbol: {symbol_setting} {data}")
         # 銘柄情報取得
         time.sleep(0.2)
-        self.query_board(symbol)
+        # self.query_board(symbol)
         self.query_contract(symbol)
         self.register_symbol(symbol)
 
@@ -897,70 +902,8 @@ class KabusRestApi(RestClient):
         """時価情報・板情報取得成功"""
         print(f"on_query_board: {data}")
         symbol = request.extra
-
         if not symbol:
             return
-
-        # Handle future to update ATM price
-        if symbol == self.trading_future_symbol:
-            current_price = data.get("CalcPrice")
-            if current_price:
-                self.atm_price = round(current_price / 500) * 500
-                self.gateway.write_log(f"[OK] board ATM {symbol}: {current_price} -> {self.atm_price}")
-                self.create_option_symbol_settings(
-                    NK225_OP_CODE,
-                    NK225_OP_MONTH,
-                    self.atm_price,
-                    NK225_OP_STRIKE_SCOPE
-                )
-
-        # Handle options to find call with delta near 0.1
-        parts = symbol.split('-')
-        if len(parts) == 4 and parts[2] == 'C':  # It's a call option, e.g., nk-2512-C-45000
-            delta = data.get("Delta")
-            impv = data.get("IV")
-            cur_price = data.get("CurrentPrice")
-            if delta is not None and cur_price is not None:
-                diff = abs(delta - 0.1)
-
-                if diff < self.eris_call_match['diff'] and delta >= 0.1:
-                    strike_price = int(parts[3])
-
-                    # OTM call option: strike price > atm price
-                    if 0 < self.atm_price < strike_price:
-                        self.eris_call_match = {
-                            'symbol': symbol,
-                            'strike': strike_price,
-                            'delta': delta,
-                            'diff': diff,
-                            'impv': impv
-                        }
-                        self.gateway.write_log(
-                            f"[OK] board {symbol}, Delta: {delta}, IV: {impv}"
-                        )
-
-        # Handle options to find put with delta near -0.1
-        elif len(parts) == 4 and parts[2] == 'P':  # It's a put option, e.g., nk-2512-P-43000
-            delta = data.get("Delta")
-            impv = data.get("IV")
-            cur_price = data.get("CurrentPrice")
-            if delta is not None and cur_price is not None:
-                diff = abs(delta + 0.1)
-                if diff < self.eris_put_match['diff'] and delta <= -0.1:
-                    strike_price = int(parts[3])
-                    # ITM
-                    if self.atm_price > 0 and strike_price < self.atm_price:
-                        self.eris_put_match = {
-                            'symbol': symbol,
-                            'strike': strike_price,
-                            'delta': delta,
-                            'diff': diff,
-                            'impv': impv
-                        }
-                        self.gateway.write_log(
-                            f"[OK] board {symbol}, Delta: {delta}, IV: {impv}"
-                        )
-
 
     def on_query_board_failed(self, status_code: int, request: Request):
         """時価情報・板情報取得失敗"""
@@ -1255,6 +1198,19 @@ class KabusWebsocketApi(WebsocketClient):
             bid_price_5=packet.get("Buy5", {}).get("Price"),
             bid_volume_5=packet.get("Buy5", {}).get("Qty"),
         )
+
+        # Handle future to update ATM price
+        if symbol == self.gateway.rest_api.trading_future_symbol and not self.gateway.rest_api.atm_price:
+            if tick.last_price:
+                atm_price = round(tick.last_price / 500) * 500
+                self.gateway.rest_api.atm_price = atm_price
+                self.gateway.write_log(f"[OK] board ATM {symbol}: {tick.last_price} -> {atm_price}")
+                self.gateway.rest_api.create_option_symbol_settings(
+                    NK225_OP_CODE,
+                    NK225_OP_MONTH,
+                    atm_price,
+                    NK225_OP_STRIKE_SCOPE
+                )
 
         # 过滤还没有收到合约数据前的行情推送
         contract: ContractData = symbol_contract_map.get(tick.symbol, None)
