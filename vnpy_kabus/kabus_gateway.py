@@ -289,6 +289,8 @@ class KabusRestApi(RestClient):
 
     def process_atm_event(self, event) -> None:
         """ATM价格变动事件处理"""
+        if not event.data:
+            return
         atm_price: int = int(float(event.data))
         self.gateway.write_log(f"[OK] ATM価格: {atm_price}")
         if self.atm_price != atm_price:
@@ -305,12 +307,12 @@ class KabusRestApi(RestClient):
     def create_option_symbol_settings(self, symbol_code: str, month: int, atm_price: int, strike_scope: int) -> None:
         """生成option symbol settings"""
         # 生成 call option symbol strike_price in range [atm_price, atm_price + strike_scope] with interval 500
-        for strike_price in range(atm_price - 500, atm_price + strike_scope + 1, 500):
+        for strike_price in range(atm_price, atm_price + strike_scope + 1, 500):
             symbol_setting = f"{symbol_code}-{month}-C-{strike_price}"
             if symbol_setting not in self.queried_symbol_settings:
                 self.symbol_settings.append(symbol_setting)
         # 生成 put option symbol strike_price in range [atm_price, atm_price - strike_scope] with interval -500
-        for strike_price in range(atm_price + 500, atm_price - strike_scope -1, -500):
+        for strike_price in range(atm_price, atm_price - strike_scope -1, -500):
             symbol_setting = f"{symbol_code}-{month}-P-{strike_price}"
             if symbol_setting not in self.queried_symbol_settings:
                 self.symbol_settings.append(symbol_setting)
