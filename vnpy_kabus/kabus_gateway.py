@@ -307,12 +307,12 @@ class KabusRestApi(RestClient):
     def create_option_symbol_settings(self, symbol_code: str, month: int, atm_price: int, strike_scope: int) -> None:
         """生成option symbol settings"""
         # 生成 call option symbol strike_price in range [atm_price, atm_price + strike_scope] with interval 500
-        for strike_price in range(atm_price, atm_price + strike_scope + 1, 500):
+        for strike_price in range(atm_price-500, atm_price + strike_scope + 1, 500):
             symbol_setting = f"{symbol_code}-{month}-C-{strike_price}"
             if symbol_setting not in self.queried_symbol_settings:
                 self.symbol_settings.append(symbol_setting)
         # 生成 put option symbol strike_price in range [atm_price, atm_price - strike_scope] with interval -500
-        for strike_price in range(atm_price, atm_price - strike_scope -1, -500):
+        for strike_price in range(atm_price+500, atm_price - strike_scope -1, -500):
             symbol_setting = f"{symbol_code}-{month}-P-{strike_price}"
             if symbol_setting not in self.queried_symbol_settings:
                 self.symbol_settings.append(symbol_setting)
@@ -1158,25 +1158,39 @@ class KabusWebsocketApi(WebsocketClient):
             self.gateway.write_log(f"[NG] 推送数据 銘柄コード変換：{symbol_kbs}")
             return
 
-        current_price_time = packet.get("CurrentPriceTime")
-        if not current_price_time:
-            return
+        # if symbol != self.gateway.rest_api.trading_future_symbol:
+        #     print(f"on_packet: {packet}")
+        last_price = None
+        bid_price_1 = packet.get("Buy1", {}).get("Price")
+        bid_volume_1 = packet.get("Buy1", {}).get("Qty")
+        ask_price_1 = packet.get("Sell1", {}).get("Price")
+        ask_volume_1 = packet.get("Sell1", {}).get("Qty")
+        if bid_price_1 and ask_price_1 and bid_volume_1 and ask_volume_1:
+            total_volume = bid_volume_1 + ask_volume_1
+            if total_volume:
+                last_price = bid_price_1 + (ask_price_1 - bid_price_1) * bid_volume_1 / total_volume
+        if last_price is None:
+            last_price = packet.get("CurrentPrice")
+
+        volume = packet.get("TradingVolume")
+        if volume is None:
+            volume = 0
 
         tick: TickData = TickData(
             gateway_name=self.gateway_name,
             symbol=symbol,
             exchange=Exchange.JPX,
-            datetime=generate_datetime(current_price_time),
+            datetime=datetime.now(JAPAN_TZ),
 
             name=packet.get("SymbolName"),
-            volume=packet.get("TradingVolume"),
+            volume=volume,
             turnover=packet.get("TradingValue"),
             open_price=packet.get("OpeningPrice"),
             high_price=packet.get("HighPrice"),
             low_price=packet.get("LowPrice"),
             pre_close=packet.get("PreviousClose"),
-            last_price=packet.get("CurrentPrice"),
-            last_volume=packet.get("TradingVolume"),
+            last_price=last_price,
+            last_volume=volume,
 
             ask_price_1=packet.get("Sell1", {}).get("Price"),
             ask_volume_1=packet.get("Sell1", {}).get("Qty"),
