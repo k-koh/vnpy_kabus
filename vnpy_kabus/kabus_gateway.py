@@ -1195,6 +1195,16 @@ class KabusWebsocketApi(WebsocketClient):
         if volume is None:
             volume = 0
 
+        open_price = packet.get("OpeningPrice")
+        if open_price is None:
+            open_price = last_price
+        high_price = packet.get("HighPrice")
+        if high_price is None:
+            high_price = last_price
+        low_price = packet.get("LowPrice")
+        if low_price is None:
+            low_price = last_price
+
         tick: TickData = TickData(
             gateway_name=self.gateway_name,
             symbol=symbol,
@@ -1204,9 +1214,9 @@ class KabusWebsocketApi(WebsocketClient):
             name=packet.get("SymbolName"),
             volume=volume,
             turnover=packet.get("TradingValue"),
-            open_price=packet.get("OpeningPrice"),
-            high_price=packet.get("HighPrice"),
-            low_price=packet.get("LowPrice"),
+            open_price=open_price,
+            high_price=high_price,
+            low_price=low_price,
             pre_close=packet.get("PreviousClose"),
             last_price=last_price,
             last_volume=volume,
