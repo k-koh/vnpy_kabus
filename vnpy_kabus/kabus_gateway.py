@@ -51,17 +51,21 @@ KBS_CallOptions = 2
 # 限月指定
 NK225_CODE                = "NK225mini"  # 日经225mini
 NK225_MONTH               = 2512  # future
+NK225_MONTH2               = 2601  # future
+SYMBOL_NK225_MONTH         = f"nk-{NK225_MONTH}"
+SYMBOL_NK225_MONTH2        = f"nk-{NK225_MONTH2}"
+
 
 NK225_OP_CODE             = "NK225op"  # 日経225オプション
 NK225_OP_MONTH            = 2512  # option
+NK225_OP_MONTH2            = 2601  # option
 
 NK225_WEEKLY_OP_CODE      = "NK225weeklyop"  # 日经225weekly
 NK225_WEEKLY_OP_MONTH     = 2512  # option weekly
 NK225_WEEKLY_OP_WEEK      = 1       # option weekly
 
-NK225_OP_STRIKE_PRICE_MIN = 45000
-NK225_OP_STRIKE_PRICE_MAX = 55000
 NK225_OP_STRIKE_SCOPE = 8000
+NK225_OP_STRIKE_SCOPE2 = 8000
 
 # REST API地址
 REST_HOST: str = "http://localhost:18080"
@@ -276,12 +280,14 @@ class KabusRestApi(RestClient):
 
         self.trading_future_symbol: str = "nk-YYMM"
         self.atm_price: int = 0
+        self.atm_price2: int = 0
         self.option_board_data: dict = {}
         self.eris_call_match: dict = {'symbol': None, 'strike': None, 'delta': None, 'diff': float('inf'), 'impv': None}
         self.eris_put_match: dict = {'symbol': None, 'strike': None, 'delta': None, 'diff': float('inf'), 'impv': None}
         # 日経225先物・オプション取得リスト
         self.symbol_settings: list = [
-            f"{NK225_CODE}-{NK225_MONTH}"
+            f"{NK225_CODE}-{NK225_MONTH}",
+            # f"{NK225_CODE}-{NK225_MONTH2}"
         ]
         self.queried_symbol_settings: list = []
         self.thread_symbol: threading.Thread = None
@@ -313,6 +319,19 @@ class KabusRestApi(RestClient):
                 self.symbol_settings.append(symbol_setting)
         # 生成 put option symbol strike_price in range [atm_price, atm_price - strike_scope] with interval -500
         for strike_price in range(atm_price+500, atm_price - strike_scope -1, -500):
+            symbol_setting = f"{symbol_code}-{month}-P-{strike_price}"
+            if symbol_setting not in self.queried_symbol_settings:
+                self.symbol_settings.append(symbol_setting)
+
+    def create_option_symbol_settings2(self, symbol_code: str, month: int, atm_price: int, strike_scope: int) -> None:
+        """生成option symbol settings"""
+        # 生成 call option symbol strike_price in range [atm_price, atm_price + strike_scope] with interval 500
+        for strike_price in range(atm_price - 1000, atm_price + strike_scope + 1, 1000):
+            symbol_setting = f"{symbol_code}-{month}-C-{strike_price}"
+            if symbol_setting not in self.queried_symbol_settings:
+                self.symbol_settings.append(symbol_setting)
+        # 生成 put option symbol strike_price in range [atm_price, atm_price - strike_scope] with interval -500
+        for strike_price in range(atm_price + 1000, atm_price - strike_scope -1, -1000):
             symbol_setting = f"{symbol_code}-{month}-P-{strike_price}"
             if symbol_setting not in self.queried_symbol_settings:
                 self.symbol_settings.append(symbol_setting)
@@ -1216,16 +1235,28 @@ class KabusWebsocketApi(WebsocketClient):
         )
 
         # Handle future to update ATM price
-        if symbol == self.gateway.rest_api.trading_future_symbol and not self.gateway.rest_api.atm_price:
+        if symbol == SYMBOL_NK225_MONTH and not self.gateway.rest_api.atm_price:
             if tick.last_price:
                 atm_price = round(tick.last_price / 500) * 500
                 self.gateway.rest_api.atm_price = atm_price
-                self.gateway.write_log(f"[OK] board ATM {symbol}: {tick.last_price} -> {atm_price}")
+                self.gateway.write_log(f"[OK] 1限月 ATM {symbol}: {tick.last_price} -> {atm_price}")
                 self.gateway.rest_api.create_option_symbol_settings(
                     NK225_OP_CODE,
                     NK225_OP_MONTH,
                     atm_price,
                     NK225_OP_STRIKE_SCOPE
+                )
+
+        if symbol == SYMBOL_NK225_MONTH2 and not self.gateway.rest_api.atm_price2:
+            if tick.last_price:
+                atm_price = round(tick.last_price / 1000) * 1000
+                self.gateway.rest_api.atm_price2 = atm_price
+                self.gateway.write_log(f"[OK] 2限月 ATM {symbol}: {tick.last_price} -> {atm_price}")
+                self.gateway.rest_api.create_option_symbol_settings2(
+                    NK225_OP_CODE,
+                    NK225_OP_MONTH2,
+                    atm_price,
+                    NK225_OP_STRIKE_SCOPE2
                 )
 
         # 过滤还没有收到合约数据前的行情推送
