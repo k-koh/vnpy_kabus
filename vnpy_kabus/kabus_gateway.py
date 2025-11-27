@@ -1194,6 +1194,9 @@ class KabusWebsocketApi(WebsocketClient):
         volume = packet.get("TradingVolume")
         if volume is None:
             volume = 0
+        turnover = packet.get("TradingValue")
+        if turnover is None:
+            turnover = 0
 
         open_price = packet.get("OpeningPrice")
         if open_price is None:
@@ -1213,7 +1216,7 @@ class KabusWebsocketApi(WebsocketClient):
 
             name=packet.get("SymbolName"),
             volume=volume,
-            turnover=packet.get("TradingValue"),
+            turnover=turnover,
             open_price=open_price,
             high_price=high_price,
             low_price=low_price,
