@@ -287,10 +287,15 @@ class KabusRestApi(RestClient):
         # 日経225先物・オプション取得リスト
         self.symbol_settings: list = [
             f"{NK225_CODE}-{NK225_MONTH}",
-            # f"{NK225_CODE}-{NK225_MONTH2}"
+            f"{NK225_CODE}-{NK225_MONTH2}"
         ]
         self.queried_symbol_settings: list = []
+        self.symbol_board_settings: list = [
+            f"{NK225_CODE}-{NK225_MONTH2}"
+        ]
+        self.symbol_boards: list = []
         self.thread_symbol: threading.Thread = None
+        self.thread_board: threading.Thread = None
         self.gateway.event_engine.register(EVENT_ATM, self.process_atm_event)
 
     def process_atm_event(self, event) -> None:
@@ -313,19 +318,6 @@ class KabusRestApi(RestClient):
     def create_option_symbol_settings(self, symbol_code: str, month: int, atm_price: int, strike_scope: int) -> None:
         """生成option symbol settings"""
         # 生成 call option symbol strike_price in range [atm_price, atm_price + strike_scope] with interval 500
-        for strike_price in range(atm_price-500, atm_price + strike_scope + 1, 500):
-            symbol_setting = f"{symbol_code}-{month}-C-{strike_price}"
-            if symbol_setting not in self.queried_symbol_settings:
-                self.symbol_settings.append(symbol_setting)
-        # 生成 put option symbol strike_price in range [atm_price, atm_price - strike_scope] with interval -500
-        for strike_price in range(atm_price+500, atm_price - strike_scope -1, -500):
-            symbol_setting = f"{symbol_code}-{month}-P-{strike_price}"
-            if symbol_setting not in self.queried_symbol_settings:
-                self.symbol_settings.append(symbol_setting)
-
-    def create_option_symbol_settings2(self, symbol_code: str, month: int, atm_price: int, strike_scope: int) -> None:
-        """生成option symbol settings"""
-        # 生成 call option symbol strike_price in range [atm_price, atm_price + strike_scope] with interval 500
         for strike_price in range(atm_price - 1000, atm_price + strike_scope + 1, 1000):
             symbol_setting = f"{symbol_code}-{month}-C-{strike_price}"
             if symbol_setting not in self.queried_symbol_settings:
@@ -335,6 +327,22 @@ class KabusRestApi(RestClient):
             symbol_setting = f"{symbol_code}-{month}-P-{strike_price}"
             if symbol_setting not in self.queried_symbol_settings:
                 self.symbol_settings.append(symbol_setting)
+
+    def create_option_symbol_board_settings(self, symbol_code: str, month: int, atm_price: int, strike_scope: int) -> None:
+        """生成option symbol settings"""
+        # 生成 call option symbol strike_price in range [atm_price, atm_price + strike_scope] with interval 500
+        for strike_price in range(atm_price - 1000, atm_price + strike_scope + 1, 1000):
+            symbol_setting = f"{symbol_code}-{month}-C-{strike_price}"
+            if symbol_setting not in self.queried_symbol_settings:
+                self.symbol_settings.append(symbol_setting)
+                self.symbol_board_settings.append(symbol_setting)
+
+        # 生成 put option symbol strike_price in range [atm_price, atm_price - strike_scope] with interval -500
+        for strike_price in range(atm_price + 1000, atm_price - strike_scope -1, -1000):
+            symbol_setting = f"{symbol_code}-{month}-P-{strike_price}"
+            if symbol_setting not in self.queried_symbol_settings:
+                self.symbol_settings.append(symbol_setting)
+                self.symbol_board_settings.append(symbol_setting)
 
 
     def sign(self, request: Request) -> Request:
@@ -398,6 +406,8 @@ class KabusRestApi(RestClient):
             self.active: bool = True
             self.thread_symbol = threading.Thread(target=self.run_query_symbol_thread)
             self.thread_symbol.start()
+            self.thread_board = threading.Thread(target=self.run_query_board_thread)
+            self.thread_board.start()
             self.thread_order = threading.Thread(target=self.run_query_order_position_thread)
             self.thread_order.start()
         else:
@@ -473,20 +483,26 @@ class KabusRestApi(RestClient):
 
     def run_query_symbol_thread(self) -> None:
         """Function run in the thread"""
-        self.gateway.write_log("[OK] 銘柄リスト取得スレッド起動")
+        self.gateway.write_log("[OK] 1限月取得スレッド起動")
         symbol_setting = self.symbol_settings.pop(0)
         self.query_symbol(symbol_setting)
         while self.active:
             time.sleep(0.2)
-            # 銘柄コード取得成功まで待機（sleep繰り返し）
-            # if not self.symbol_registered:
-            #     continue
             if self.symbol_settings:
-                # self.symbol_registered = False
                 symbol_setting = self.symbol_settings.pop(0)
                 self.query_symbol(symbol_setting)
-        # self.contract_inited = True
-        self.gateway.write_log("[OK] 銘柄リスト取得スレッド終了")
+        self.gateway.write_log("[OK] 1限月取得スレッド終了")
+
+    def run_query_board_thread(self) -> None:
+        """Function run in the thread"""
+        self.gateway.write_log("[OK] 2限月取得スレッド起動")
+        while self.active:
+            time.sleep(1.0)
+            if self.symbol_boards:
+                symbol = self.symbol_boards.pop(0)
+                self.query_board(symbol)
+                self.symbol_boards.append(symbol)
+        self.gateway.write_log("[OK] 2限月取得スレッド終了")
 
 
     def run_query_order_position_thread(self) -> None:
@@ -518,6 +534,9 @@ class KabusRestApi(RestClient):
         if self.thread_symbol and self.thread_symbol.is_alive():
             self.thread_symbol.join()
         self.thread_symbol = None
+        if self.thread_board and self.thread_board.is_alive():
+            self.thread_board.join()
+        self.thread_board = None
         if self.thread_order and self.thread_order.is_alive():
             self.thread_order.join()
         self.thread_order = None
@@ -771,10 +790,11 @@ class KabusRestApi(RestClient):
         self.gateway.write_log("[OK] symbol: " + symbol_setting + " (" + symbol_kbs + ")")
         print(f"on_query_symbol: {symbol_setting} {data}")
         # 銘柄情報取得
-        time.sleep(0.2)
-        # self.query_board(symbol)
         self.query_contract(symbol)
-        self.register_symbol(symbol)
+        if symbol_setting in self.symbol_board_settings:
+            self.symbol_boards.append(symbol)
+        else:
+            self.register_symbol(symbol)
 
 
     def on_query_symbol_failed(self, status_code: int, request: Request):
@@ -923,8 +943,8 @@ class KabusRestApi(RestClient):
         """時価情報・板情報取得成功"""
         print(f"on_query_board: {data}")
         symbol = request.extra
-        if not symbol:
-            return
+        self.gateway.write_log("[OK] board " + symbol)
+        self.gateway.ws_api.on_packet(data)
 
     def on_query_board_failed(self, status_code: int, request: Request):
         """時価情報・板情報取得失敗"""
@@ -1265,7 +1285,7 @@ class KabusWebsocketApi(WebsocketClient):
                 atm_price = round(tick.last_price / 1000) * 1000
                 self.gateway.rest_api.atm_price2 = atm_price
                 self.gateway.write_log(f"[OK] 2限月 ATM {symbol}: {tick.last_price} -> {atm_price}")
-                self.gateway.rest_api.create_option_symbol_settings2(
+                self.gateway.rest_api.create_option_symbol_board_settings(
                     NK225_OP_CODE,
                     NK225_OP_MONTH2,
                     atm_price,
