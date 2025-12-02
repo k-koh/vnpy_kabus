@@ -34,7 +34,7 @@ from vnpy.trader.object import (
     TickData,
     TradeData,
     HistoryRequest,
-    BarData
+    BarData, AtmData
 )
 from vnpy.trader.event import EVENT_TIMER, EVENT_ATM
 
@@ -64,8 +64,8 @@ NK225_WEEKLY_OP_CODE      = "NK225weeklyop"  # 日经225weekly
 NK225_WEEKLY_OP_MONTH     = 2512  # option weekly
 NK225_WEEKLY_OP_WEEK      = 1       # option weekly
 
-NK225_OP_STRIKE_SCOPE = 8000
-NK225_OP_STRIKE_SCOPE2 = 8000
+NK225_OP_STRIKE_SCOPE = 9000
+NK225_OP_STRIKE_SCOPE2 = 9000
 
 # REST API地址
 REST_HOST: str = "http://localhost:18080"
@@ -291,7 +291,7 @@ class KabusRestApi(RestClient):
         ]
         self.queried_symbol_settings: list = []
         self.symbol_board_settings: list = [
-            f"{NK225_CODE}-{NK225_MONTH2}"
+            # f"{NK225_CODE}-{NK225_MONTH2}"
         ]
         self.symbol_boards: list = []
         self.thread_symbol: threading.Thread = None
@@ -300,18 +300,24 @@ class KabusRestApi(RestClient):
 
     def process_atm_event(self, event) -> None:
         """ATM价格变动事件处理"""
-        if not event.data:
-            return
-        atm_price: int = int(float(event.data))
-        self.gateway.write_log(f"[OK] ATM価格: {atm_price}")
+        atm: AtmData = event.data
+        atm_price: int = atm.atm_strike
+        chain_symbol: str = atm.chain_symbol
+        self.gateway.write_log(f"[OK] {chain_symbol} ATM価格: {atm_price}")
         if self.atm_price != atm_price:
-            self.gateway.write_log(f"[OK] ATM価格変更: {self.atm_price} -> {atm_price}")
+            self.gateway.write_log(f"[OK] {chain_symbol} ATM価格変更: {self.atm_price} -> {atm_price}")
             self.atm_price = atm_price
             self.create_option_symbol_settings(
                 NK225_OP_CODE,
                 NK225_OP_MONTH,
                 self.atm_price,
                 NK225_OP_STRIKE_SCOPE
+            )
+            self.gateway.rest_api.create_option_symbol_board_settings(
+                NK225_OP_CODE,
+                NK225_OP_MONTH2,
+                self.atm_price,
+                NK225_OP_STRIKE_SCOPE2
             )
 
 
@@ -335,14 +341,16 @@ class KabusRestApi(RestClient):
             symbol_setting = f"{symbol_code}-{month}-C-{strike_price}"
             if symbol_setting not in self.queried_symbol_settings:
                 self.symbol_settings.append(symbol_setting)
-                self.symbol_board_settings.append(symbol_setting)
+                # query symbol using board api
+                # self.symbol_board_settings.append(symbol_setting)
 
         # 生成 put option symbol strike_price in range [atm_price, atm_price - strike_scope] with interval -500
         for strike_price in range(atm_price + 1000, atm_price - strike_scope -1, -1000):
             symbol_setting = f"{symbol_code}-{month}-P-{strike_price}"
             if symbol_setting not in self.queried_symbol_settings:
                 self.symbol_settings.append(symbol_setting)
-                self.symbol_board_settings.append(symbol_setting)
+                # query symbol using board api
+                # self.symbol_board_settings.append(symbol_setting)
 
 
     def sign(self, request: Request) -> Request:
@@ -611,7 +619,7 @@ class KabusRestApi(RestClient):
             on_failed=self.on_query_board_failed,
             extra=symbol
         )
-        self.gateway.write_log("[__] board: " + symbol)
+        # self.gateway.write_log("[__] board: " + symbol)
 
     def query_contract(self, symbol: str) -> None:
         """銘柄情報取得"""
@@ -941,9 +949,9 @@ class KabusRestApi(RestClient):
 
     def on_query_board(self, data: dict, request: Request):
         """時価情報・板情報取得成功"""
-        print(f"on_query_board: {data}")
+        # print(f"on_query_board: {data}")
         symbol = request.extra
-        self.gateway.write_log("[OK] board " + symbol)
+        # self.gateway.write_log("[OK] board " + symbol)
         self.gateway.ws_api.on_packet(data)
 
     def on_query_board_failed(self, status_code: int, request: Request):
@@ -1019,12 +1027,12 @@ class KabusRestApi(RestClient):
 
     def on_register_symbol(self, data: dict, request: Request) -> None:
         """Tickデータ受信登録成功"""
-        print(f"on_register_symbol:")
-        for s in data["RegistList"]:
-            pprint.pprint(s)
+        print(f"on_register_symbol: count={len(data['RegistList'])}")
+        # for s in data["RegistList"]:
+        #     pprint.pprint(s)
 
         symbol = request.extra
-        self.gateway.write_log("[OK] register " + symbol)
+        self.gateway.write_log("[OK] register " + symbol + f" (count={len(data['RegistList'])})")
         self.symbol_registered = True
 
     def on_register_failed(self, status_code: int, request: Request) -> None:
@@ -1270,7 +1278,7 @@ class KabusWebsocketApi(WebsocketClient):
         # Handle future to update ATM price
         if symbol == SYMBOL_NK225_MONTH and not self.gateway.rest_api.atm_price:
             if tick.last_price:
-                atm_price = round(tick.last_price / 500) * 500
+                atm_price = round(tick.last_price / 1000) * 1000
                 self.gateway.rest_api.atm_price = atm_price
                 self.gateway.write_log(f"[OK] 1限月 ATM {symbol}: {tick.last_price} -> {atm_price}")
                 self.gateway.rest_api.create_option_symbol_settings(
