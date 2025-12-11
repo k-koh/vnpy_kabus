@@ -73,6 +73,10 @@ REST_HOST: str = "http://localhost:18080"
 # Websocket API地址
 WEBSOCKET_HOST: str = "ws://localhost:18080/kabusapi/websocket"
 
+RAKUTEN_RSS_REST_HOST: str = "http://localhost:8766"
+
+RAKUTEN_RSS_WEBSOCKET_HOST: str = "ws://localhost:8765/ws/"
+
 # 委托类型映射
 ORDERTYPE_VT2KBS = {
     OrderType.LIMIT: "20",   # 指値
@@ -165,6 +169,8 @@ class KabusGateway(BaseGateway):
         """构造函数"""
         super().__init__(event_engine, gateway_name)
 
+        self.ws_rakuten_api: "RakutenWebsocketApi" = RakutenWebsocketApi(self)
+        self.rest_rakuten_api: "RakutenRestApi" = RakutenRestApi(self)
         self.ws_api: "KabusWebsocketApi" = KabusWebsocketApi(self)
         self.rest_api: "KabusRestApi" = KabusRestApi(self)
 
@@ -180,6 +186,8 @@ class KabusGateway(BaseGateway):
         """连接交易接口"""
         key: str = setting["API Key"]
 
+        self.rest_rakuten_api.connect(key)
+        self.ws_rakuten_api.connect(key)
         self.rest_api.connect(key)
         self.ws_api.connect(key)
 
@@ -230,6 +238,7 @@ class KabusGateway(BaseGateway):
         """关闭连接"""
         self.rest_api.stop()
         self.ws_api.stop()
+        self.ws_rakuten_api.stop()
         self.rest_api.stop_query_order()
         self.rest_api.join_query_order()
 
@@ -243,6 +252,7 @@ class KabusGateway(BaseGateway):
             return
         self.count = 0
         self.ws_api.ping()
+        # self.ws_rakuten_api.ping()
 
     def init_ping(self) -> None:
         """初始化心跳"""
@@ -261,6 +271,7 @@ class KabusRestApi(RestClient):
         self.gateway_name: str = gateway.gateway_name
 
         self.ws_api: KabusWebsocketApi = self.gateway.ws_api
+        self.ws_rakuten_api: RakutenWebsocketApi = self.gateway.ws_rakuten_api
 
         # 保存用户登陆信息
         self.key: str = ""
@@ -290,9 +301,7 @@ class KabusRestApi(RestClient):
             f"{NK225_CODE}-{NK225_MONTH2}"
         ]
         self.queried_symbol_settings: list = []
-        self.symbol_board_settings: list = [
-            # f"{NK225_CODE}-{NK225_MONTH2}"
-        ]
+        self.rakuten_symbol_settings: list = []
         self.symbol_boards: list = []
         self.thread_symbol: threading.Thread = None
         self.thread_board: threading.Thread = None
@@ -313,7 +322,7 @@ class KabusRestApi(RestClient):
                 self.atm_price,
                 NK225_OP_STRIKE_SCOPE
             )
-            self.gateway.rest_api.create_option_symbol_board_settings(
+            self.create_option_symbol_settings(
                 NK225_OP_CODE,
                 NK225_OP_MONTH2,
                 self.atm_price,
@@ -328,29 +337,24 @@ class KabusRestApi(RestClient):
             symbol_setting = f"{symbol_code}-{month}-C-{strike_price}"
             if symbol_setting not in self.queried_symbol_settings:
                 self.symbol_settings.append(symbol_setting)
-        # 生成 put option symbol strike_price in range [atm_price, atm_price - strike_scope] with interval -500
-        for strike_price in range(atm_price + 1000, atm_price - strike_scope -1, -1000):
-            symbol_setting = f"{symbol_code}-{month}-P-{strike_price}"
-            if symbol_setting not in self.queried_symbol_settings:
-                self.symbol_settings.append(symbol_setting)
-
-    def create_option_symbol_board_settings(self, symbol_code: str, month: int, atm_price: int, strike_scope: int) -> None:
-        """生成option symbol settings"""
-        # 生成 call option symbol strike_price in range [atm_price, atm_price + strike_scope] with interval 500
-        for strike_price in range(atm_price - 1000, atm_price + strike_scope + 1, 1000):
-            symbol_setting = f"{symbol_code}-{month}-C-{strike_price}"
-            if symbol_setting not in self.queried_symbol_settings:
-                self.symbol_settings.append(symbol_setting)
-                # query symbol using board api
-                # self.symbol_board_settings.append(symbol_setting)
+            # strike_price with interval 500
+            # strike_price += 500
+            # symbol_setting = f"{symbol_code}-{month}-C-{strike_price}"
+            # if symbol_setting not in self.queried_symbol_settings:
+            #     self.rakuten_symbol_settings.append(symbol_setting)
+            #     self.symbol_settings.append(symbol_setting)
 
         # 生成 put option symbol strike_price in range [atm_price, atm_price - strike_scope] with interval -500
         for strike_price in range(atm_price + 1000, atm_price - strike_scope -1, -1000):
             symbol_setting = f"{symbol_code}-{month}-P-{strike_price}"
             if symbol_setting not in self.queried_symbol_settings:
                 self.symbol_settings.append(symbol_setting)
-                # query symbol using board api
-                # self.symbol_board_settings.append(symbol_setting)
+            # strike_price with interval 500
+            # strike_price -= 500
+            # symbol_setting = f"{symbol_code}-{month}-P-{strike_price}"
+            # if symbol_setting not in self.queried_symbol_settings:
+            #     self.rakuten_symbol_settings.append(symbol_setting)
+            #     self.symbol_settings.append(symbol_setting)
 
 
     def sign(self, request: Request) -> Request:
@@ -789,18 +793,18 @@ class KabusRestApi(RestClient):
 
     def on_query_symbol(self, data: dict, request: Request) -> None:
         """銘柄コード取得成功"""
-        symbol_setting = request.extra
+        symbol_setting = request.extra # ex. NK225op-2512-P-47000
         self.queried_symbol_settings.append(symbol_setting)
 
-        symbol_kbs = data["Symbol"]
-        symbol = self.get_symbol_from_setting(symbol_setting)
+        symbol_kbs = data["Symbol"] # ex. 180247018
+        symbol = self.get_symbol_from_setting(symbol_setting) # ex. nk-2512-P-47000
         SYMBOL_VT2KBS[symbol] = symbol_kbs
         self.gateway.write_log("[OK] symbol: " + symbol_setting + " (" + symbol_kbs + ")")
         print(f"on_query_symbol: {symbol_setting} {data}")
         # 銘柄情報取得
         self.query_contract(symbol)
-        if symbol_setting in self.symbol_board_settings:
-            self.symbol_boards.append(symbol)
+        if symbol_setting in self.rakuten_symbol_settings:
+            self.gateway.rest_rakuten_api.register_symbol(symbol)
         else:
             self.register_symbol(symbol)
 
@@ -1293,7 +1297,7 @@ class KabusWebsocketApi(WebsocketClient):
                 atm_price = round(tick.last_price / 1000) * 1000
                 self.gateway.rest_api.atm_price2 = atm_price
                 self.gateway.write_log(f"[OK] 2限月 ATM {symbol}: {tick.last_price} -> {atm_price}")
-                self.gateway.rest_api.create_option_symbol_board_settings(
+                self.gateway.rest_api.create_option_symbol_settings(
                     NK225_OP_CODE,
                     NK225_OP_MONTH2,
                     atm_price,
@@ -1365,6 +1369,384 @@ class KabusWebsocketApi(WebsocketClient):
         if self.thread and self.thread.is_alive():
             self.thread.join()
         self.thread = None
+
+
+class RakutenRestApi(RestClient):
+    """Rakuten的REST API"""
+
+    def __init__(self, gateway: KabusGateway) -> None:
+        """构造函数"""
+        super().__init__()
+
+        self.gateway: KabusGateway = gateway
+        self.gateway_name: str = gateway.gateway_name
+
+        self.ws_rakuten_api: RakutenWebsocketApi = self.gateway.ws_rakuten_api
+
+        # 保存用户登陆信息
+        self.key: str = ""
+        self.token: str = ""
+
+        # 确保生成的orderid不发生冲突
+        self.order_count: int = 2_000_000
+        self.order_count_lock: Lock = Lock()
+        self.connect_time: int = 0
+
+        self.active: bool = False
+        self.thread_order: threading.Thread = None
+        self.lock: threading.Lock = threading.Lock()
+
+        self.trading_future_symbol: str = "nk-YYMM"
+        self.atm_price: int = 0
+        self.atm_price2: int = 0
+        self.option_board_data: dict = {}
+
+        self.thread_symbol: threading.Thread = None
+
+
+    def sign(self, request: Request) -> Request:
+        """生成FTX签名"""
+        if request.data:
+            request.data = json.dumps(request.data).encode('utf8')
+        if request.headers is None:
+            request.headers = {'Content-Type': 'application/json'}
+        if self.token:
+            request.headers['X-API-KEY'] = self.token
+
+        return request
+
+    def connect(
+        self,
+        key: str
+    ) -> None:
+        """连接REST服务器"""
+        self.key = key
+
+        # 生成本地委托号
+        self.connect_time = (
+            int(datetime.now().strftime("%y%m%d%H%M%S")) * self.order_count
+        )
+
+        self.init(RAKUTEN_RSS_REST_HOST)
+        self.start()
+
+        self.gateway.write_log("[OK] rakuten REST API启动")
+
+        self.query_token()
+
+    def query_token(self) -> None:
+        """トークン発行"""
+        data: dict = {"APIPassword": self.key}
+
+        path: str = "/rakutenapi/token"
+
+        self.add_request(
+            method="POST",
+            path=path,
+            callback=self.on_query_token,
+            data=data,
+            on_failed = self.on_query_token_failed
+        )
+
+    def on_query_token(self, data: dict, request: Request) -> None:
+        """トークン発行"""
+        print(f"rakuten on_query_token: {data}")
+        if data["ResultCode"] == 0:
+            self.token = data["Token"]
+            self.gateway.write_log("[OK] rakuten トークン取得: {self.token}")
+
+            self.unregister_all()
+        else:
+            self.gateway.write_log("[NG] rakuten トークン取得")
+
+    def on_query_token_failed(self, status_code: int, request: Request):
+        """トークン発行失敗"""
+        msg = f"[NG] rakuten トークン発行, 状态码：{status_code}，信息：{request.response.text}"
+        self.gateway.write_log(msg)
+
+
+    def unregister_all(self):
+        """全銘柄登録解除"""
+        path: str = "/rakutenapi/unregister/all"
+
+        self.add_request(
+            method="PUT",
+            path=path,
+            callback=self.on_unregister_all,
+            on_failed=self.on_unregister_all_failed
+        )
+
+
+    def on_unregister_all(self, data: dict, request: Request) -> None:
+        """全銘柄登録解除成功"""
+        print(f"rakuten on_unregister_all: {data}")
+        self.gateway.write_log("[OK] rakuten 全銘柄登録解除")
+
+    def on_unregister_all_failed(self, status_code: int, request: Request) -> None:
+        """全銘柄登録解除失敗"""
+        msg = f"[NG] rakuten 全銘柄登録解除，状态码：{status_code}，信息：{request.response.text}"
+        self.gateway.write_log(msg)
+
+
+    def register_symbol(self, symbol: str):
+        """Tickデータ受信登録"""
+        symbol_ksb = SYMBOL_VT2KBS.get(symbol, None)
+        if symbol_ksb is None:
+            self.gateway.write_log(f"[NG] rakuten Tickデータ受信登録 銘柄コード変換：{symbol}")
+            return
+
+        # symbol = '160060023'
+        market = '2' # 1: 東証、3: 名証、5: 福証、6: 札証、2: 日通し、23: 日中、24: 夜間
+        data = {'Symbols':
+            [
+                {'Symbol': symbol_ksb, 'Exchange': market}
+            ]}
+
+        path: str = "/rakutenapi/register"
+
+        self.add_request(
+            method="PUT",
+            path=path,
+            callback=self.on_register_symbol,
+            data=data,
+            on_failed=self.on_register_failed,
+            extra=symbol
+        )
+        self.gateway.write_log("[__] rakuten register: " + symbol)
+
+
+    def on_register_symbol(self, data: dict, request: Request) -> None:
+        """Tickデータ受信登録成功"""
+        print(f"rakuten on_register_symbol: count={len(data['RegistList'])}")
+        # for s in data["RegistList"]:
+        #     pprint.pprint(s)
+
+        symbol = request.extra
+        self.gateway.write_log("[OK] rakuten register " + symbol + f" (count={len(data['RegistList'])})")
+
+
+    def on_register_failed(self, status_code: int, request: Request) -> None:
+        """Tickデータ受信登録失敗"""
+        symbol = request.extra
+        msg = f"[NG] rakuten register: {symbol}，状态码：{status_code}，信息：{request.response.text}"
+        self.gateway.write_log(msg)
+        # retry register symbol
+        time.sleep(0.2)
+        self.register_symbol(symbol)
+
+    def on_failed(self, status_code: int, request: Request) -> None:
+        """失败回报"""
+        msg = f"[NG] rakuten 状态码：{status_code}，信息：{request.response.text}"
+        self.gateway.write_log(msg)
+
+
+
+class RakutenWebsocketApi(WebsocketClient):
+    """Rakuten RSS交易Websocket API"""
+
+    def __init__(self, gateway: KabusGateway) -> None:
+        """构造函数"""
+        super().__init__()
+
+        self.gateway: KabusGateway = gateway
+        self.gateway_name: str = gateway.gateway_name
+
+        self.subscribed: Dict[str, SubscribeRequest] = {}
+
+        self.start_time = datetime.utcnow().date()
+        self.count = 0
+
+        # Database历史Tick数据模拟实盘行情
+        self.history_data: list = []
+        self.active: bool = False
+        self.thread: threading.Thread = None
+        self.lock: threading.Lock = threading.Lock()
+
+    def connect(
+        self,
+        api_key: str
+    ) -> None:
+        """连接Websocket交易频道"""
+        self.api_key = api_key
+        self.init(RAKUTEN_RSS_WEBSOCKET_HOST)
+        self.start()
+
+        self.gateway.write_log("[OK] rakuten 時価Websocket 起動")
+
+        # Database历史Tick数据模拟实盘行情
+        # self.load_data()
+        # self.active: bool = True
+        # self.thread = threading.Thread(target=self.run_tickdata_thread)
+        # self.thread.start()
+
+    def on_connected(self) -> None:
+        """连接成功回报"""
+        self.gateway.write_log("[OK] rakuten 時価Websocket 接続")
+
+        # self.ping()
+
+        for req in list(self.subscribed.values()):
+            self.resubscribe(req)
+
+
+    def on_disconnected(self) -> None:
+        """"""
+        self.gateway.write_log("[OK] rakuten 時価Websocket 切断")
+
+
+    def subscribe(self, req: SubscribeRequest) -> None:
+        """订阅行情"""
+        if req.symbol not in symbol_contract_map:
+            self.gateway.write_log(f"[NG] rakuten 找不到该合约代码{req.symbol}")
+            return
+
+        if req.vt_symbol in self.subscribed:
+            return
+
+        self.subscribed[req.vt_symbol] = req
+
+
+    def unsubscribe(self, req: SubscribeRequest) -> None:
+        """取消订阅行情"""
+        if req.symbol not in symbol_contract_map:
+            self.gateway.write_log(f"[NG] rakuten 找不到该合约代码{req.symbol}")
+            return
+
+        if req.vt_symbol in self.subscribed:
+            self.subscribed.pop(req.vt_symbol)
+
+    def resubscribe(self, req: SubscribeRequest) -> None:
+        """重连后订阅行情"""
+        if req.symbol not in symbol_contract_map:
+            self.gateway.write_log(f"[NG] rakuten 找不到该合约代码{req.symbol}")
+            return
+
+        self.subscribed[req.vt_symbol] = req
+
+
+    def ping(self) -> None:
+        """发送心跳"""
+        self.send_packet({'op': 'ping'})
+
+
+    def on_packet(self, packet: Any) -> None:
+        """推送数据回报"""
+        # print(f"rakuten on_packet: {packet}")
+        if not packet or not isinstance(packet, dict):
+            return
+
+        symbol_kbs = packet.get('Symbol')
+        if not symbol_kbs:
+            return
+
+        symbol = symbol_kbs2vt(SYMBOL_VT2KBS, symbol_kbs)
+        if symbol is None:
+            self.gateway.write_log(f"[NG] rakuten 推送数据 銘柄コード変換：{symbol_kbs}")
+            return
+
+        # if symbol != self.gateway.rest_api.trading_future_symbol:
+        #     print(f"on_packet: {packet}")
+        last_price = None
+        bid_price_1 = packet.get("Buy1", {}).get("Price")
+        bid_volume_1 = packet.get("Buy1", {}).get("Qty")
+        ask_price_1 = packet.get("Sell1", {}).get("Price")
+        ask_volume_1 = packet.get("Sell1", {}).get("Qty")
+        if bid_price_1 and ask_price_1 and bid_volume_1 and ask_volume_1:
+            total_volume = bid_volume_1 + ask_volume_1
+            if total_volume:
+                last_price = bid_price_1 + (ask_price_1 - bid_price_1) * bid_volume_1 / total_volume
+        if last_price is None:
+            last_price = packet.get("CurrentPrice")
+
+        volume = packet.get("TradingVolume")
+        if volume is None:
+            volume = 0
+        turnover = packet.get("TradingValue")
+        if turnover is None:
+            turnover = 0
+
+        open_price = packet.get("OpeningPrice")
+        if open_price is None:
+            open_price = last_price
+        high_price = packet.get("HighPrice")
+        if high_price is None:
+            high_price = last_price
+        low_price = packet.get("LowPrice")
+        if low_price is None:
+            low_price = last_price
+
+        tick: TickData = TickData(
+            gateway_name=self.gateway_name,
+            symbol=symbol,
+            exchange=Exchange.JPX,
+            datetime=datetime.now(JAPAN_TZ),
+
+            name=packet.get("SymbolName"),
+            volume=volume,
+            turnover=turnover,
+            open_price=open_price,
+            high_price=high_price,
+            low_price=low_price,
+            pre_close=packet.get("PreviousClose"),
+            last_price=last_price,
+            last_volume=volume,
+
+            ask_price_1=packet.get("Sell1", {}).get("Price"),
+            ask_volume_1=packet.get("Sell1", {}).get("Qty"),
+            ask_price_2=packet.get("Sell2", {}).get("Price"),
+            ask_volume_2=packet.get("Sell2", {}).get("Qty"),
+            ask_price_3=packet.get("Sell3", {}).get("Price"),
+            ask_volume_3=packet.get("Sell3", {}).get("Qty"),
+            ask_price_4=packet.get("Sell4", {}).get("Price"),
+            ask_volume_4=packet.get("Sell4", {}).get("Qty"),
+            ask_price_5=packet.get("Sell5", {}).get("Price"),
+            ask_volume_5=packet.get("Sell5", {}).get("Qty"),
+
+            bid_price_1=packet.get("Buy1", {}).get("Price"),
+            bid_volume_1=packet.get("Buy1", {}).get("Qty"),
+            bid_price_2=packet.get("Buy2", {}).get("Price"),
+            bid_volume_2=packet.get("Buy2", {}).get("Qty"),
+            bid_price_3=packet.get("Buy3", {}).get("Price"),
+            bid_volume_3=packet.get("Buy3", {}).get("Qty"),
+            bid_price_4=packet.get("Buy4", {}).get("Price"),
+            bid_volume_4=packet.get("Buy4", {}).get("Qty"),
+            bid_price_5=packet.get("Buy5", {}).get("Price"),
+            bid_volume_5=packet.get("Buy5", {}).get("Qty"),
+        )
+
+        # Handle future to update ATM price
+        if symbol == SYMBOL_NK225_MONTH and not self.gateway.rest_api.atm_price:
+            if tick.last_price:
+                atm_price = round(tick.last_price / 1000) * 1000
+                self.gateway.rest_api.atm_price = atm_price
+                self.gateway.write_log(f"[OK] 1限月 ATM {symbol}: {tick.last_price} -> {atm_price}")
+                self.gateway.rest_api.create_option_symbol_settings(
+                    NK225_OP_CODE,
+                    NK225_OP_MONTH,
+                    atm_price,
+                    NK225_OP_STRIKE_SCOPE
+                )
+
+        if symbol == SYMBOL_NK225_MONTH2 and not self.gateway.rest_api.atm_price2:
+            if tick.last_price:
+                atm_price = round(tick.last_price / 1000) * 1000
+                self.gateway.rest_api.atm_price2 = atm_price
+                self.gateway.write_log(f"[OK] 2限月 ATM {symbol}: {tick.last_price} -> {atm_price}")
+                self.gateway.rest_api.create_option_symbol_settings(
+                    NK225_OP_CODE,
+                    NK225_OP_MONTH2,
+                    atm_price,
+                    NK225_OP_STRIKE_SCOPE2
+                )
+
+        # 过滤还没有收到合约数据前的行情推送
+        contract: ContractData = symbol_contract_map.get(tick.symbol, None)
+        if not contract:
+            return
+
+        if tick.last_price:
+            self.gateway.on_tick(copy(tick))
+
 
 
 def change_datetime(created_time: str) -> datetime:
