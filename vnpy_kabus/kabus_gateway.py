@@ -50,18 +50,18 @@ KBS_CallOptions = 2
 
 # 限月指定
 NK225_CODE                = "NK225mini"  # 日经225mini
-NK225_MONTH               = 2512  # future
-NK225_MONTH2               = 2601  # future
+NK225_MONTH               = 2601  # future
+NK225_MONTH2               = 2602  # future
 SYMBOL_NK225_MONTH         = f"nk-{NK225_MONTH}"
 SYMBOL_NK225_MONTH2        = f"nk-{NK225_MONTH2}"
 
 
 NK225_OP_CODE             = "NK225op"  # 日経225オプション
-NK225_OP_MONTH            = 2512  # option
-NK225_OP_MONTH2            = 2601  # option
+NK225_OP_MONTH            = 2601  # option
+NK225_OP_MONTH2            = 2602  # option
 
 NK225_WEEKLY_OP_CODE      = "NK225weeklyop"  # 日经225weekly
-NK225_WEEKLY_OP_MONTH     = 2512  # option weekly
+NK225_WEEKLY_OP_MONTH     = 2601  # option weekly
 NK225_WEEKLY_OP_WEEK      = 1       # option weekly
 
 NK225_OP_STRIKE_SCOPE = 9000
@@ -802,10 +802,12 @@ class KabusRestApi(RestClient):
         self.gateway.write_log("[OK] symbol: " + symbol_setting + " (" + symbol_kbs + ")")
         print(f"on_query_symbol: {symbol_setting} {data}")
         # 銘柄情報取得
-        self.query_contract(symbol)
+
         if symbol_setting in self.rakuten_symbol_settings:
+            self.gateway.rest_rakuten_api.query_contract(symbol)
             self.gateway.rest_rakuten_api.register_symbol(symbol)
         else:
+            self.query_contract(symbol)
             self.register_symbol(symbol)
 
 
@@ -1488,6 +1490,88 @@ class RakutenRestApi(RestClient):
         self.gateway.write_log(msg)
 
 
+    def query_contract(self, symbol: str) -> None:
+        """銘柄情報取得"""
+        # 'http://localhost:18080/kabusapi/symbol/160060023@2?addinfo=false'
+        symbol_ksb = SYMBOL_VT2KBS.get(symbol, None)
+        if symbol_ksb is None:
+            self.gateway.write_log(f"[NG] rakuten 銘柄情報取得 銘柄コード変換：{symbol}")
+            return
+
+        path: str = f"/rakutenapi/symbol/{symbol_ksb}"
+
+        self.add_request(
+            method="GET",
+            path=path,
+            callback=self.on_query_contract,
+            on_failed=self.on_query_contract_failed,
+            extra=symbol
+        )
+        self.gateway.write_log("[__] rakuten contract: " + symbol)
+
+    def on_query_contract(self, data: dict, request: Request):
+        """銘柄情報取得成功"""
+        print(f"rakuten on_query_contract: {data}")
+        symbol = request.extra
+        contract: ContractData = ContractData(
+            symbol=symbol,
+            exchange=Exchange.JPX,
+            name=data["SymbolName"],
+            pricetick=5.0,
+            size=1,
+            min_volume=data["TradingUnit"],
+            product=Product.FUTURES,  # 先物に固定
+            net_position=False,
+            history_data=False,
+            gateway_name=self.gateway_name,
+        )
+
+        # 期权相关
+        if data.get("StrikePrice", None) is not None:
+            product_id   = "nk_o"              # 'nk_o'
+            deriv_month  = data["DerivMonth"]  # '26-01'
+            deriv_month  = deriv_month[0:2] + deriv_month[3:5]   # '2601'
+            deriv_weekly = data.get("DerivWeekly", None) # No Data
+            # 获取期权标的
+            underlyer    = f"nk-{deriv_month}"                   # nk-2601
+            # 期权周限月
+            # if deriv_weekly is not None:
+            #     underlyer = f"{underlyer}-{deriv_weekly}"        # nk-2505-3
+            contract.product = Product.OPTION                    # 期权
+            contract.option_portfolio = product_id               # ProductID:         nk_o            # (portfolio)
+            contract.option_underlying = underlyer               # UnderlyingInstrID: nk-2506         # (chain)
+            contract.option_type = OPTIONTYPE_KBS2VT.get(data["PutOrCall"], None)
+            contract.option_strike = data["StrikePrice"]
+            contract.option_index = str(data["StrikePrice"])
+            contract.option_expiry = datetime.strptime(str(data["TradeEnd"]), "%Y/%m/%d")
+            contract.option_listed = contract.option_expiry - timedelta(days=60)  # 60日前に設定
+        else:
+            contract.product = Product.FUTURES
+            deriv_month  = data["DerivMonth"]  # '26-01'
+            deriv_month  = deriv_month[0:2] + deriv_month[3:5]   # '2601'
+            underlyer    = f"nk-{deriv_month}"                   # nk-2601
+            contract.option_underlying = underlyer               # UnderlyingInstrID: nk-2601  # (chain)
+
+
+        self.gateway.on_contract(contract)
+
+        symbol_contract_map[contract.symbol] = contract
+
+        self.gateway.write_log("[OK] rakuten contract: " + contract.symbol)
+        # Tickデータ受信登録
+        # time.sleep(0.2)
+        # self.register_symbol(symbol)
+
+    def on_query_contract_failed(self, status_code: int, request: Request):
+        """銘柄情報取得失敗"""
+        symbol = request.extra
+        msg = f"[NG] rakuten contract: {symbol}，状态码：{status_code}，信息：{request.response.text}"
+        self.gateway.write_log(msg)
+        # retry query contract
+        time.sleep(0.2)
+        self.query_contract(symbol)
+
+
     def register_symbol(self, symbol: str):
         """Tickデータ受信登録"""
         symbol_ksb = SYMBOL_VT2KBS.get(symbol, None)
@@ -1632,6 +1716,8 @@ class RakutenWebsocketApi(WebsocketClient):
     def on_packet(self, packet: Any) -> None:
         """推送数据回报"""
         # print(f"rakuten on_packet: {packet}")
+        return
+
         if not packet or not isinstance(packet, dict):
             return
 
