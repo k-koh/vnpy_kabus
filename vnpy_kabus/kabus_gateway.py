@@ -48,6 +48,9 @@ JAPAN_TZ = pytz.timezone("Asia/Tokyo")
 KBS_PutOptions  = 1
 KBS_CallOptions = 2
 
+RKT_PutOptions  = "P"
+RKT_CallOptions = "C"
+
 # 限月指定
 NK225_CODE                = "NK225mini"  # 日经225mini
 NK225_MONTH               = 2601  # future
@@ -115,6 +118,11 @@ CASHMARGIN_KBS2VT = {v: k for k, v in CASHMARGIN_VT2KBS.items()}
 OPTIONTYPE_KBS2VT: dict[int, OptionType] = {
     KBS_CallOptions: OptionType.CALL,
     KBS_PutOptions: OptionType.PUT
+}
+
+OPTIONTYPE_RKT2VT: dict[str, OptionType] = {
+    RKT_CallOptions: OptionType.CALL,
+    RKT_PutOptions: OptionType.PUT
 }
 
 # 窗口长度映射
@@ -238,7 +246,10 @@ class KabusGateway(BaseGateway):
         """关闭连接"""
         self.rest_api.stop()
         self.ws_api.stop()
+        self.rest_rakuten_api.stop()
         self.ws_rakuten_api.stop()
+        self.rest_rakuten_api.stop_query_order()
+        self.rest_rakuten_api.join_query_order()
         self.rest_api.stop_query_order()
         self.rest_api.join_query_order()
 
@@ -251,7 +262,7 @@ class KabusGateway(BaseGateway):
         if self.count < 15:
             return
         self.count = 0
-        self.ws_api.ping()
+        # self.ws_api.ping()
         # self.ws_rakuten_api.ping()
 
     def init_ping(self) -> None:
@@ -283,7 +294,6 @@ class KabusRestApi(RestClient):
         self.connect_time: int = 0
 
         self.contract_inited: bool = False
-        self.symbol_registered: bool = False
 
         self.active: bool = False
         self.thread_order: threading.Thread = None
@@ -302,14 +312,13 @@ class KabusRestApi(RestClient):
         ]
         self.queried_symbol_settings: list = []
         self.rakuten_symbol_settings: list = []
-        self.symbol_boards: list = []
         self.thread_symbol: threading.Thread = None
-        self.thread_board: threading.Thread = None
         self.gateway.event_engine.register(EVENT_ATM, self.process_atm_event)
 
     def process_atm_event(self, event) -> None:
         """ATM价格变动事件处理"""
         atm: AtmData = event.data
+        print(f"[OK] process_atm_event: {atm}")
         atm_price: int = atm.atm_strike
         chain_symbol: str = atm.chain_symbol
         self.gateway.write_log(f"[OK] {chain_symbol} ATM価格: {atm_price}")
@@ -383,7 +392,8 @@ class KabusRestApi(RestClient):
         self.init(REST_HOST)
         self.start()
 
-        self.gateway.write_log("[OK] REST API启动")
+        print("[__] REST API启动")
+        self.gateway.write_log("[__] REST API启动")
 
         self.query_token()
 
@@ -400,10 +410,11 @@ class KabusRestApi(RestClient):
             data=data,
             on_failed = self.on_query_token_failed
         )
+        print("[__] query_token")
 
     def on_query_token(self, data: dict, request: Request) -> None:
         """トークン発行"""
-        print(f"on_query_token: {data}")
+        print(f"[OK] on_query_token: {data}")
         if data["ResultCode"] == 0:
             self.token = data["Token"]
             self.gateway.write_log("[OK] トークン取得")
@@ -418,8 +429,6 @@ class KabusRestApi(RestClient):
             self.active: bool = True
             self.thread_symbol = threading.Thread(target=self.run_query_symbol_thread)
             self.thread_symbol.start()
-            self.thread_board = threading.Thread(target=self.run_query_board_thread)
-            self.thread_board.start()
             self.thread_order = threading.Thread(target=self.run_query_order_position_thread)
             self.thread_order.start()
         else:
@@ -435,10 +444,12 @@ class KabusRestApi(RestClient):
             callback=self.on_unregister_all,
             on_failed=self.on_unregister_all_failed
         )
+        print("[__] unregister_all")
 
     def on_query_token_failed(self, status_code: int, request: Request):
         """トークン発行失敗"""
         msg = f"[NG] トークン発行, 状态码：{status_code}，信息：{request.response.text}"
+        print(msg)
         self.gateway.write_log(msg)
 
     def query_symbol(self, symbol_setting: str) -> None:
@@ -491,11 +502,12 @@ class KabusRestApi(RestClient):
             on_failed=self.on_query_symbol_failed,
             extra=symbol_setting
         )
+        print(f"[__] symbol: {symbol_setting}")
         self.gateway.write_log("[__] symbol: " + symbol_setting)
 
     def run_query_symbol_thread(self) -> None:
         """Function run in the thread"""
-        self.gateway.write_log("[OK] 1限月取得スレッド起動")
+        self.gateway.write_log("[__] Symbol取得スレッド起動")
         symbol_setting = self.symbol_settings.pop(0)
         self.query_symbol(symbol_setting)
         while self.active:
@@ -503,18 +515,7 @@ class KabusRestApi(RestClient):
             if self.symbol_settings:
                 symbol_setting = self.symbol_settings.pop(0)
                 self.query_symbol(symbol_setting)
-        self.gateway.write_log("[OK] 1限月取得スレッド終了")
-
-    def run_query_board_thread(self) -> None:
-        """Function run in the thread"""
-        self.gateway.write_log("[OK] 2限月取得スレッド起動")
-        while self.active:
-            time.sleep(1.0)
-            if self.symbol_boards:
-                symbol = self.symbol_boards.pop(0)
-                self.query_board(symbol)
-                self.symbol_boards.append(symbol)
-        self.gateway.write_log("[OK] 2限月取得スレッド終了")
+        self.gateway.write_log("[OK] Symbol取得スレッド終了")
 
 
     def run_query_order_position_thread(self) -> None:
@@ -546,9 +547,6 @@ class KabusRestApi(RestClient):
         if self.thread_symbol and self.thread_symbol.is_alive():
             self.thread_symbol.join()
         self.thread_symbol = None
-        if self.thread_board and self.thread_board.is_alive():
-            self.thread_board.join()
-        self.thread_board = None
         if self.thread_order and self.thread_order.is_alive():
             self.thread_order.join()
         self.thread_order = None
@@ -566,6 +564,7 @@ class KabusRestApi(RestClient):
             callback=self.on_query_account,
             on_failed = self.on_failed
         )
+        print(f"[__] account")
 
     def query_position(self) -> None:
         """ポジション照会"""
@@ -607,24 +606,6 @@ class KabusRestApi(RestClient):
             extra=query_time
         )
 
-    def query_board(self, symbol: str) -> None:
-        """時価情報・板情報取得"""
-        # 'http://localhost:18080/kabusapi/board/5401@1'
-        symbol_ksb = SYMBOL_VT2KBS.get(symbol, None)
-        if symbol_ksb is None:
-            self.gateway.write_log(f"[NG] 時価情報取得 銘柄コード変換：{symbol}")
-            return
-        market = '2' # 1: 東証、3: 名証、5: 福証、6: 札証、2: 日通し、23: 日中、24: 夜間
-        path: str = f"/kabusapi/board/{symbol_ksb}@{market}"
-        self.add_request(
-            method="GET",
-            path=path,
-            callback=self.on_query_board,
-            on_failed=self.on_query_board_failed,
-            extra=symbol
-        )
-        # self.gateway.write_log("[__] board: " + symbol)
-
     def query_contract(self, symbol: str) -> None:
         """銘柄情報取得"""
         # 'http://localhost:18080/kabusapi/symbol/160060023@2?addinfo=false'
@@ -645,6 +626,7 @@ class KabusRestApi(RestClient):
             on_failed=self.on_query_contract_failed,
             extra=symbol
         )
+        print(f"[__] contract: {symbol}")
         self.gateway.write_log("[__] contract: " + symbol)
 
     def register_symbol(self, symbol: str):
@@ -671,6 +653,7 @@ class KabusRestApi(RestClient):
             on_failed=self.on_register_failed,
             extra=symbol
         )
+        print(f"[__] register: {symbol}")
         self.gateway.write_log("[__] register: " + symbol)
 
     def _new_order_id(self) -> int:
@@ -799,7 +782,8 @@ class KabusRestApi(RestClient):
         symbol_kbs = data["Symbol"] # ex. 180247018
         symbol = self.get_symbol_from_setting(symbol_setting) # ex. nk-2512-P-47000
         SYMBOL_VT2KBS[symbol] = symbol_kbs
-        self.gateway.write_log("[OK] symbol: " + symbol_setting + " (" + symbol_kbs + ")")
+        msg = f"[OK] symbol: {symbol_setting} -> {symbol_kbs}"
+        self.gateway.write_log(msg)
         print(f"on_query_symbol: {symbol_setting} {data}")
         # 銘柄情報取得
 
@@ -815,7 +799,12 @@ class KabusRestApi(RestClient):
         """銘柄コード取得失敗"""
         symbol_setting = request.extra
         msg = f"[NG] symbol: {symbol_setting}，状态码：{status_code}，信息：{request.response.text}"
+        print(msg)
         self.gateway.write_log(msg)
+        # "Code":4002001 "Message":"銘柄が見つからない"
+        # strike_price with interval 500 is not found, exit without retry
+        if request.response.text.find("4002001") != -1:
+            return
         # retry query symbol
         time.sleep(0.2)
         self.query_symbol(symbol_setting)
@@ -866,6 +855,7 @@ class KabusRestApi(RestClient):
     def on_position_failed(self, status_code: int, request: Request) -> None:
         """ポジション照会"""
         msg = f"[NG] ポジション照会，状态码：{status_code}，信息：{request.response.text}"
+        print(msg)
         self.gateway.write_log(msg)
 
     def on_query_order(self, data: dict, request: Request) -> None:
@@ -951,23 +941,8 @@ class KabusRestApi(RestClient):
     def on_query_order_failed(self, status_code: int, request: Request):
         """注文約定照会"""
         msg = f"[NG] 注文約定照会，状态码：{status_code}，信息：{request.response.text}"
+        print(msg)
         self.gateway.write_log(msg)
-
-    def on_query_board(self, data: dict, request: Request):
-        """時価情報・板情報取得成功"""
-        # print(f"on_query_board: {data}")
-        symbol = request.extra
-        # self.gateway.write_log("[OK] board " + symbol)
-        self.gateway.ws_api.on_packet(data)
-
-    def on_query_board_failed(self, status_code: int, request: Request):
-        """時価情報・板情報取得失敗"""
-        symbol = request.extra
-        msg = f"[NG] board: {symbol}，状态码：{status_code}，信息：{request.response.text}"
-        self.gateway.write_log(msg)
-        # retry query contract
-        time.sleep(0.2)
-        self.query_board(symbol)
 
     def on_query_contract(self, data: dict, request: Request):
         """銘柄情報取得成功"""
@@ -1026,6 +1001,7 @@ class KabusRestApi(RestClient):
         """銘柄情報取得失敗"""
         symbol = request.extra
         msg = f"[NG] contract: {symbol}，状态码：{status_code}，信息：{request.response.text}"
+        print(msg)
         self.gateway.write_log(msg)
         # retry query contract
         time.sleep(0.2)
@@ -1038,13 +1014,15 @@ class KabusRestApi(RestClient):
         #     pprint.pprint(s)
 
         symbol = request.extra
-        self.gateway.write_log("[OK] register " + symbol + f" (count={len(data['RegistList'])})")
-        self.symbol_registered = True
+        msg = f"[OK] register: {symbol} (count={len(data['RegistList'])})"
+        print(msg)
+        self.gateway.write_log(msg)
 
     def on_register_failed(self, status_code: int, request: Request) -> None:
         """Tickデータ受信登録失敗"""
         symbol = request.extra
         msg = f"[NG] register: {symbol}，状态码：{status_code}，信息：{request.response.text}"
+        print(msg)
         self.gateway.write_log(msg)
         # retry register symbol
         time.sleep(0.2)
@@ -1098,6 +1076,7 @@ class KabusRestApi(RestClient):
     def on_failed(self, status_code: int, request: Request) -> None:
         """失败回报"""
         msg = f"[NG] 状态码：{status_code}，信息：{request.response.text}"
+        print(msg)
         self.gateway.write_log(msg)
 
     def query_history(self, req: HistoryRequest) -> List[BarData]:
@@ -1138,7 +1117,7 @@ class KabusWebsocketApi(WebsocketClient):
         self.init(WEBSOCKET_HOST)
         self.start()
 
-        self.gateway.write_log("[OK] 時価Websocket 起動")
+        self.gateway.write_log("[__] 時価Websocket 接続")
 
         # Database历史Tick数据模拟实盘行情
         # self.load_data()
@@ -1403,7 +1382,63 @@ class RakutenRestApi(RestClient):
         self.atm_price2: int = 0
         self.option_board_data: dict = {}
 
+        # 日経225先物・オプション取得リスト
+        self.symbol_settings: list = [
+            f"{NK225_CODE}-{NK225_MONTH}",
+            f"{NK225_CODE}-{NK225_MONTH2}"
+        ]
+        self.queried_symbol_settings: list = []
         self.thread_symbol: threading.Thread = None
+        self.gateway.event_engine.register(EVENT_ATM, self.process_atm_event)
+
+    def process_atm_event(self, event) -> None:
+        """ATM价格变动事件处理"""
+        atm: AtmData = event.data
+        print(f"[OK] rakuten process_atm_event: {atm}")
+        atm_price: int = atm.atm_strike
+        chain_symbol: str = atm.chain_symbol
+        self.gateway.write_log(f"[OK] rakuten {chain_symbol} ATM価格: {atm_price}")
+        if self.atm_price != atm_price:
+            self.gateway.write_log(f"[OK] rakuten {chain_symbol} ATM価格変更: {self.atm_price} -> {atm_price}")
+            self.atm_price = atm_price
+            self.create_option_symbol_settings(
+                NK225_OP_CODE,
+                NK225_OP_MONTH,
+                self.atm_price,
+                NK225_OP_STRIKE_SCOPE
+            )
+            self.create_option_symbol_settings(
+                NK225_OP_CODE,
+                NK225_OP_MONTH2,
+                self.atm_price,
+                NK225_OP_STRIKE_SCOPE2
+            )
+
+
+    def create_option_symbol_settings(self, symbol_code: str, month: int, atm_price: int, strike_scope: int) -> None:
+        """生成option symbol settings"""
+        # 生成 call option symbol strike_price in range [atm_price, atm_price + strike_scope] with interval 500
+        for strike_price in range(atm_price - 1000, atm_price + strike_scope + 1, 1000):
+            symbol_setting = f"{symbol_code}-{month}-C-{strike_price}"
+            if symbol_setting not in self.queried_symbol_settings:
+                self.symbol_settings.append(symbol_setting)
+            # strike_price with interval 500
+            strike_price += 500
+            symbol_setting = f"{symbol_code}-{month}-C-{strike_price}"
+            if symbol_setting not in self.queried_symbol_settings:
+                self.symbol_settings.append(symbol_setting)
+
+        # 生成 put option symbol strike_price in range [atm_price, atm_price - strike_scope] with interval -500
+        for strike_price in range(atm_price + 1000, atm_price - strike_scope -1, -1000):
+            symbol_setting = f"{symbol_code}-{month}-P-{strike_price}"
+            if symbol_setting not in self.queried_symbol_settings:
+                self.symbol_settings.append(symbol_setting)
+            # strike_price with interval 500
+            strike_price -= 500
+            symbol_setting = f"{symbol_code}-{month}-P-{strike_price}"
+            if symbol_setting not in self.queried_symbol_settings:
+                self.symbol_settings.append(symbol_setting)
+
 
 
     def sign(self, request: Request) -> Request:
@@ -1432,7 +1467,8 @@ class RakutenRestApi(RestClient):
         self.init(RAKUTEN_RSS_REST_HOST)
         self.start()
 
-        self.gateway.write_log("[OK] rakuten REST API启动")
+        self.gateway.write_log("[__] rakuten REST API启动")
+        print("[__] rakuten REST API启动")
 
         self.query_token()
 
@@ -1449,6 +1485,7 @@ class RakutenRestApi(RestClient):
             data=data,
             on_failed = self.on_query_token_failed
         )
+        print("[__] rakuten query_token")
 
     def on_query_token(self, data: dict, request: Request) -> None:
         """トークン発行"""
@@ -1458,12 +1495,18 @@ class RakutenRestApi(RestClient):
             self.gateway.write_log("[OK] rakuten トークン取得: {self.token}")
 
             self.unregister_all()
+
+            # Start the thread to process incoming data
+            self.active: bool = True
+            self.thread_symbol = threading.Thread(target=self.run_query_symbol_thread)
+            self.thread_symbol.start()
         else:
             self.gateway.write_log("[NG] rakuten トークン取得")
 
     def on_query_token_failed(self, status_code: int, request: Request):
         """トークン発行失敗"""
         msg = f"[NG] rakuten トークン発行, 状态码：{status_code}，信息：{request.response.text}"
+        print(msg)
         self.gateway.write_log(msg)
 
 
@@ -1477,6 +1520,7 @@ class RakutenRestApi(RestClient):
             callback=self.on_unregister_all,
             on_failed=self.on_unregister_all_failed
         )
+        print("[__] rakuten unregister_all")
 
 
     def on_unregister_all(self, data: dict, request: Request) -> None:
@@ -1487,7 +1531,109 @@ class RakutenRestApi(RestClient):
     def on_unregister_all_failed(self, status_code: int, request: Request) -> None:
         """全銘柄登録解除失敗"""
         msg = f"[NG] rakuten 全銘柄登録解除，状态码：{status_code}，信息：{request.response.text}"
+        print(msg)
         self.gateway.write_log(msg)
+
+    def query_symbol(self, symbol_setting: str) -> None:
+    # def query_symbol(self, code: str, month: int, op_weekly: int=None, op_type: str=None, op_strike_price: int=None) -> None:
+        """銘柄コード取得"""
+        # 'http://localhost:18080/kabusapi/symbolname/{future|option|minioptionweekly}'
+        # OptionCode - NK225op:日経225オプション、NK225miniop:日経225ミニオプション
+        # PutOrCall - P: PUT, C: CALL
+        # Result
+        # 200 OK
+        # {'Symbol': '130195526', 'SymbolName': '日経平均ミニオプション 25/05 2週限 プット 35500'}
+        # HTTP Error 400: Bad Request
+        # {'Code': 4002001, 'Message': '銘柄が見つからない'}
+        # split the string into parts
+        parts = symbol_setting.split("-")
+        code = parts[0]  # NK225mini, NK225op
+        month = parts[1]  # 2506
+
+        # DerivMonth: 限月はyyyyMM形式で指定します。0を指定した場合、直近限月となります。
+        deriv_month = month[0:2] + "-" + month[2:4]  # '26-01'
+        if code in ['NK225', 'NK225mini', 'NK225micro']:
+            op_type               = "F"        # Future
+            op_strike_price       = "0"
+        elif code in ['NK225op', 'NK225miniop']:
+            op_type               = parts[2]   # P, C
+            op_strike_price       = parts[3]
+
+        name = deriv_month + "-" + op_type + "-" + op_strike_price
+        path: str = f"/rakutenapi/symbolname/{name}"
+
+        self.add_request(
+            method="GET",
+            path=path,
+            callback=self.on_query_symbol,
+            on_failed=self.on_query_symbol_failed,
+            extra=symbol_setting
+        )
+        print(f"[__] symbol: {symbol_setting}")
+        self.gateway.write_log("[__] symbol: " + symbol_setting)
+
+    def run_query_symbol_thread(self) -> None:
+        """Function run in the thread"""
+        self.gateway.write_log("[__] rakuten Symbol取得スレッド起動")
+        symbol_setting = self.symbol_settings.pop(0)
+        self.query_symbol(symbol_setting)
+        while self.active:
+            time.sleep(0.2)
+            if self.symbol_settings:
+                symbol_setting = self.symbol_settings.pop(0)
+                self.query_symbol(symbol_setting)
+        self.gateway.write_log("[OK] rakuten Symbol取得スレッド終了")
+
+    def stop_query_order(self) -> None:
+        """Stop query_order"""
+        if not self.active:
+            return
+        self.active = False
+
+    def join_query_order(self) -> None:
+        """Join to wait the thread exit loop"""
+        if self.thread_symbol and self.thread_symbol.is_alive():
+            self.thread_symbol.join()
+        self.thread_symbol = None
+
+
+    def get_symbol_from_setting(self, symbol_setting: str) -> str:
+        """从symbol_command中获取symbol"""
+        parts = symbol_setting.split("-")
+        parts[0] = "nk"
+        # partsを結合してsymbolを作成
+        symbol = "-".join(parts)
+        return symbol
+
+    def on_query_symbol(self, data: dict, request: Request) -> None:
+        """銘柄コード取得成功"""
+        symbol_setting = request.extra # ex. NK225op-2512-P-47000
+        self.queried_symbol_settings.append(symbol_setting)
+
+        symbol_kbs = data["Symbol"] # ex. 180247018
+        symbol = self.get_symbol_from_setting(symbol_setting) # ex. nk-2512-P-47000
+        SYMBOL_VT2KBS[symbol] = symbol_kbs
+        msg = f"[OK] rakuten symbol: {symbol_setting} -> {symbol_kbs}"
+        self.gateway.write_log(msg)
+        print(f"rakuten on_query_symbol: {symbol_setting} {data}")
+        # 銘柄情報取得
+        self.query_contract(symbol)
+        self.register_symbol(symbol)
+
+
+    def on_query_symbol_failed(self, status_code: int, request: Request):
+        """銘柄コード取得失敗"""
+        symbol_setting = request.extra
+        msg = f"[NG] rakuten symbol: {symbol_setting}，状态码：{status_code}，信息：{request.response.text}"
+        print(msg)
+        self.gateway.write_log(msg)
+        # "Code":4002001 "Message":"銘柄が見つからない"
+        # strike_price with interval 500 is not found, exit without retry
+        if request.response.text.find("4002001") != -1:
+            return
+        # retry query symbol
+        time.sleep(0.2)
+        self.query_symbol(symbol_setting)
 
 
     def query_contract(self, symbol: str) -> None:
@@ -1507,6 +1653,7 @@ class RakutenRestApi(RestClient):
             on_failed=self.on_query_contract_failed,
             extra=symbol
         )
+        print(f"[__] rakuten query_contract: {symbol}")
         self.gateway.write_log("[__] rakuten contract: " + symbol)
 
     def on_query_contract(self, data: dict, request: Request):
@@ -1519,7 +1666,7 @@ class RakutenRestApi(RestClient):
             name=data["SymbolName"],
             pricetick=5.0,
             size=1,
-            min_volume=data["TradingUnit"],
+            min_volume=float(data["TradingUnit"]),
             product=Product.FUTURES,  # 先物に固定
             net_position=False,
             history_data=False,
@@ -1527,7 +1674,8 @@ class RakutenRestApi(RestClient):
         )
 
         # 期权相关
-        if data.get("StrikePrice", None) is not None:
+        strike_price = float(data.get("StrikePrice", 0))
+        if strike_price:
             product_id   = "nk_o"              # 'nk_o'
             deriv_month  = data["DerivMonth"]  # '26-01'
             deriv_month  = deriv_month[0:2] + deriv_month[3:5]   # '2601'
@@ -1540,8 +1688,8 @@ class RakutenRestApi(RestClient):
             contract.product = Product.OPTION                    # 期权
             contract.option_portfolio = product_id               # ProductID:         nk_o            # (portfolio)
             contract.option_underlying = underlyer               # UnderlyingInstrID: nk-2506         # (chain)
-            contract.option_type = OPTIONTYPE_KBS2VT.get(data["PutOrCall"], None)
-            contract.option_strike = data["StrikePrice"]
+            contract.option_type = OPTIONTYPE_RKT2VT.get(data["PutOrCall"], None)
+            contract.option_strike = float(data["StrikePrice"])
             contract.option_index = str(data["StrikePrice"])
             contract.option_expiry = datetime.strptime(str(data["TradeEnd"]), "%Y/%m/%d")
             contract.option_listed = contract.option_expiry - timedelta(days=60)  # 60日前に設定
@@ -1566,7 +1714,12 @@ class RakutenRestApi(RestClient):
         """銘柄情報取得失敗"""
         symbol = request.extra
         msg = f"[NG] rakuten contract: {symbol}，状态码：{status_code}，信息：{request.response.text}"
+        print(msg)
         self.gateway.write_log(msg)
+        # "Code":4002001 "Message":"銘柄が見つからない"
+        # strike_price with interval 500 is not found, exit without retry
+        if request.response.text.find("4002001") != -1:
+            return
         # retry query contract
         time.sleep(0.2)
         self.query_contract(symbol)
@@ -1596,6 +1749,7 @@ class RakutenRestApi(RestClient):
             on_failed=self.on_register_failed,
             extra=symbol
         )
+        print(f"[__] rakuten register_symbol: {symbol}")
         self.gateway.write_log("[__] rakuten register: " + symbol)
 
 
@@ -1613,6 +1767,7 @@ class RakutenRestApi(RestClient):
         """Tickデータ受信登録失敗"""
         symbol = request.extra
         msg = f"[NG] rakuten register: {symbol}，状态码：{status_code}，信息：{request.response.text}"
+        print(msg)
         self.gateway.write_log(msg)
         # retry register symbol
         time.sleep(0.2)
@@ -1621,6 +1776,7 @@ class RakutenRestApi(RestClient):
     def on_failed(self, status_code: int, request: Request) -> None:
         """失败回报"""
         msg = f"[NG] rakuten 状态码：{status_code}，信息：{request.response.text}"
+        print(msg)
         self.gateway.write_log(msg)
 
 
@@ -1655,7 +1811,7 @@ class RakutenWebsocketApi(WebsocketClient):
         self.init(RAKUTEN_RSS_WEBSOCKET_HOST)
         self.start()
 
-        self.gateway.write_log("[OK] rakuten 時価Websocket 起動")
+        self.gateway.write_log("[__] rakuten 時価Websocket 接続")
 
         # Database历史Tick数据模拟实盘行情
         # self.load_data()
@@ -1716,7 +1872,6 @@ class RakutenWebsocketApi(WebsocketClient):
     def on_packet(self, packet: Any) -> None:
         """推送数据回报"""
         # print(f"rakuten on_packet: {packet}")
-        return
 
         if not packet or not isinstance(packet, dict):
             return
@@ -1733,32 +1888,28 @@ class RakutenWebsocketApi(WebsocketClient):
         # if symbol != self.gateway.rest_api.trading_future_symbol:
         #     print(f"on_packet: {packet}")
         last_price = None
-        bid_price_1 = packet.get("Buy1", {}).get("Price")
-        bid_volume_1 = packet.get("Buy1", {}).get("Qty")
-        ask_price_1 = packet.get("Sell1", {}).get("Price")
-        ask_volume_1 = packet.get("Sell1", {}).get("Qty")
+        bid_price_1  = float(packet.get("Buy1_Price"))
+        bid_volume_1 = float(packet.get("Buy1_Qty"))
+        ask_price_1  = float(packet.get("Sell1_Price"))
+        ask_volume_1 = float(packet.get("Sell1_Qty"))
         if bid_price_1 and ask_price_1 and bid_volume_1 and ask_volume_1:
             total_volume = bid_volume_1 + ask_volume_1
             if total_volume:
                 last_price = bid_price_1 + (ask_price_1 - bid_price_1) * bid_volume_1 / total_volume
         if last_price is None:
-            last_price = packet.get("CurrentPrice")
+            last_price = float(packet.get("CurrentPrice"))
 
-        volume = packet.get("TradingVolume")
-        if volume is None:
-            volume = 0
-        turnover = packet.get("TradingValue")
-        if turnover is None:
-            turnover = 0
+        volume = float(packet.get("TradingVolume"))
+        turnover = float(packet.get("TradingValue"))
 
-        open_price = packet.get("OpeningPrice")
-        if open_price is None:
+        open_price = float(packet.get("OpeningPrice"))
+        if not open_price:
             open_price = last_price
-        high_price = packet.get("HighPrice")
-        if high_price is None:
+        high_price = float(packet.get("HighPrice"))
+        if not high_price:
             high_price = last_price
-        low_price = packet.get("LowPrice")
-        if low_price is None:
+        low_price = float(packet.get("LowPrice"))
+        if not low_price:
             low_price = last_price
 
         tick: TickData = TickData(
@@ -1773,52 +1924,37 @@ class RakutenWebsocketApi(WebsocketClient):
             open_price=open_price,
             high_price=high_price,
             low_price=low_price,
-            pre_close=packet.get("PreviousClose"),
+            pre_close=float(packet.get("PreviousClose")),
             last_price=last_price,
             last_volume=volume,
 
-            ask_price_1=packet.get("Sell1", {}).get("Price"),
-            ask_volume_1=packet.get("Sell1", {}).get("Qty"),
-            ask_price_2=packet.get("Sell2", {}).get("Price"),
-            ask_volume_2=packet.get("Sell2", {}).get("Qty"),
-            ask_price_3=packet.get("Sell3", {}).get("Price"),
-            ask_volume_3=packet.get("Sell3", {}).get("Qty"),
-            ask_price_4=packet.get("Sell4", {}).get("Price"),
-            ask_volume_4=packet.get("Sell4", {}).get("Qty"),
-            ask_price_5=packet.get("Sell5", {}).get("Price"),
-            ask_volume_5=packet.get("Sell5", {}).get("Qty"),
+            ask_price_1=ask_price_1,
+            ask_volume_1=ask_volume_1,
 
-            bid_price_1=packet.get("Buy1", {}).get("Price"),
-            bid_volume_1=packet.get("Buy1", {}).get("Qty"),
-            bid_price_2=packet.get("Buy2", {}).get("Price"),
-            bid_volume_2=packet.get("Buy2", {}).get("Qty"),
-            bid_price_3=packet.get("Buy3", {}).get("Price"),
-            bid_volume_3=packet.get("Buy3", {}).get("Qty"),
-            bid_price_4=packet.get("Buy4", {}).get("Price"),
-            bid_volume_4=packet.get("Buy4", {}).get("Qty"),
-            bid_price_5=packet.get("Buy5", {}).get("Price"),
-            bid_volume_5=packet.get("Buy5", {}).get("Qty"),
+            bid_price_1=bid_price_1,
+            bid_volume_1=bid_volume_1,
+
         )
 
         # Handle future to update ATM price
-        if symbol == SYMBOL_NK225_MONTH and not self.gateway.rest_api.atm_price:
+        if symbol == SYMBOL_NK225_MONTH and not self.gateway.rest_rakuten_api.atm_price:
             if tick.last_price:
                 atm_price = round(tick.last_price / 1000) * 1000
-                self.gateway.rest_api.atm_price = atm_price
-                self.gateway.write_log(f"[OK] 1限月 ATM {symbol}: {tick.last_price} -> {atm_price}")
-                self.gateway.rest_api.create_option_symbol_settings(
+                self.gateway.rest_rakuten_api.atm_price = atm_price
+                self.gateway.write_log(f"[OK] rakuten 1限月 ATM {symbol}: {tick.last_price} -> {atm_price}")
+                self.gateway.rest_rakuten_api.create_option_symbol_settings(
                     NK225_OP_CODE,
                     NK225_OP_MONTH,
                     atm_price,
                     NK225_OP_STRIKE_SCOPE
                 )
 
-        if symbol == SYMBOL_NK225_MONTH2 and not self.gateway.rest_api.atm_price2:
+        if symbol == SYMBOL_NK225_MONTH2 and not self.gateway.rest_rakuten_api.atm_price2:
             if tick.last_price:
                 atm_price = round(tick.last_price / 1000) * 1000
-                self.gateway.rest_api.atm_price2 = atm_price
-                self.gateway.write_log(f"[OK] 2限月 ATM {symbol}: {tick.last_price} -> {atm_price}")
-                self.gateway.rest_api.create_option_symbol_settings(
+                self.gateway.rest_rakuten_api.atm_price2 = atm_price
+                self.gateway.write_log(f"[OK] rakuten 2限月 ATM {symbol}: {tick.last_price} -> {atm_price}")
+                self.gateway.rest_rakuten_api.create_option_symbol_settings(
                     NK225_OP_CODE,
                     NK225_OP_MONTH2,
                     atm_price,
