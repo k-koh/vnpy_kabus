@@ -262,7 +262,7 @@ class KabusGateway(BaseGateway):
         if self.count < 15:
             return
         self.count = 0
-        # self.ws_api.ping()
+        self.ws_api.ping()
         # self.ws_rakuten_api.ping()
 
     def init_ping(self) -> None:
@@ -311,7 +311,6 @@ class KabusRestApi(RestClient):
             f"{NK225_CODE}-{NK225_MONTH2}"
         ]
         self.queried_symbol_settings: list = []
-        self.rakuten_symbol_settings: list = []
         self.thread_symbol: threading.Thread = None
         self.gateway.event_engine.register(EVENT_ATM, self.process_atm_event)
 
@@ -347,11 +346,10 @@ class KabusRestApi(RestClient):
             if symbol_setting not in self.queried_symbol_settings:
                 self.symbol_settings.append(symbol_setting)
             # strike_price with interval 500
-            # strike_price += 500
-            # symbol_setting = f"{symbol_code}-{month}-C-{strike_price}"
-            # if symbol_setting not in self.queried_symbol_settings:
-            #     self.rakuten_symbol_settings.append(symbol_setting)
-            #     self.symbol_settings.append(symbol_setting)
+            strike_price += 500
+            symbol_setting = f"{symbol_code}-{month}-C-{strike_price}"
+            if symbol_setting not in self.queried_symbol_settings:
+                self.gateway.rest_rakuten_api.symbol_settings.append(symbol_setting)
 
         # 生成 put option symbol strike_price in range [atm_price, atm_price - strike_scope] with interval -500
         for strike_price in range(atm_price + 1000, atm_price - strike_scope -1, -1000):
@@ -359,11 +357,10 @@ class KabusRestApi(RestClient):
             if symbol_setting not in self.queried_symbol_settings:
                 self.symbol_settings.append(symbol_setting)
             # strike_price with interval 500
-            # strike_price -= 500
-            # symbol_setting = f"{symbol_code}-{month}-P-{strike_price}"
-            # if symbol_setting not in self.queried_symbol_settings:
-            #     self.rakuten_symbol_settings.append(symbol_setting)
-            #     self.symbol_settings.append(symbol_setting)
+            strike_price -= 500
+            symbol_setting = f"{symbol_code}-{month}-P-{strike_price}"
+            if symbol_setting not in self.queried_symbol_settings:
+                self.gateway.rest_rakuten_api.symbol_settings.append(symbol_setting)
 
 
     def sign(self, request: Request) -> Request:
@@ -786,13 +783,8 @@ class KabusRestApi(RestClient):
         self.gateway.write_log(msg)
         print(f"on_query_symbol: {symbol_setting} {data}")
         # 銘柄情報取得
-
-        if symbol_setting in self.rakuten_symbol_settings:
-            self.gateway.rest_rakuten_api.query_contract(symbol)
-            self.gateway.rest_rakuten_api.register_symbol(symbol)
-        else:
-            self.query_contract(symbol)
-            self.register_symbol(symbol)
+        self.query_contract(symbol)
+        self.register_symbol(symbol)
 
 
     def on_query_symbol_failed(self, status_code: int, request: Request):
@@ -1575,8 +1567,8 @@ class RakutenRestApi(RestClient):
     def run_query_symbol_thread(self) -> None:
         """Function run in the thread"""
         self.gateway.write_log("[__] rakuten Symbol取得スレッド起動")
-        symbol_setting = self.symbol_settings.pop(0)
-        self.query_symbol(symbol_setting)
+        # symbol_setting = self.symbol_settings.pop(0)
+        # self.query_symbol(symbol_setting)
         while self.active:
             time.sleep(0.2)
             if self.symbol_settings:
