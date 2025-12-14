@@ -1376,12 +1376,12 @@ class RakutenRestApi(RestClient):
 
         # 日経225先物・オプション取得リスト
         self.symbol_settings: list = [
-            f"{NK225_CODE}-{NK225_MONTH}",
-            f"{NK225_CODE}-{NK225_MONTH2}"
+            # f"{NK225_CODE}-{NK225_MONTH}",
+            # f"{NK225_CODE}-{NK225_MONTH2}"
         ]
         self.queried_symbol_settings: list = []
         self.thread_symbol: threading.Thread = None
-        self.gateway.event_engine.register(EVENT_ATM, self.process_atm_event)
+        # self.gateway.event_engine.register(EVENT_ATM, self.process_atm_event)
 
     def process_atm_event(self, event) -> None:
         """ATM价格变动事件处理"""
@@ -1484,7 +1484,7 @@ class RakutenRestApi(RestClient):
         print(f"rakuten on_query_token: {data}")
         if data["ResultCode"] == 0:
             self.token = data["Token"]
-            self.gateway.write_log("[OK] rakuten トークン取得: {self.token}")
+            self.gateway.write_log("[OK] rakuten トークン取得")
 
             self.unregister_all()
 
