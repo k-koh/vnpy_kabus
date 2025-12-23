@@ -67,7 +67,7 @@ NK225_WEEKLY_OP_CODE      = "NK225weeklyop"  # 日经225weekly
 NK225_WEEKLY_OP_MONTH     = 2601  # option weekly
 NK225_WEEKLY_OP_WEEK      = 1       # option weekly
 
-NK225_OP_STRIKE_SCOPE = 9000
+NK225_OP_STRIKE_SCOPE  = 9000
 NK225_OP_STRIKE_SCOPE2 = 9000
 
 # REST API地址
@@ -319,21 +319,26 @@ class KabusRestApi(RestClient):
         atm: AtmData = event.data
         print(f"[OK] process_atm_event: {atm}")
         atm_price: int = atm.atm_strike
+        atm_price = round(atm_price / 1000) * 1000
         chain_symbol: str = atm.chain_symbol
+        chain_symbol = chain_symbol.split(".")[0]  # 去掉(nk-2601.JPX) JPX部分
         self.gateway.write_log(f"[OK] {chain_symbol} ATM価格: {atm_price}")
-        if self.atm_price != atm_price:
+        if (chain_symbol == SYMBOL_NK225_MONTH) and (self.atm_price != atm_price):
             self.gateway.write_log(f"[OK] {chain_symbol} ATM価格変更: {self.atm_price} -> {atm_price}")
             self.atm_price = atm_price
             self.create_option_symbol_settings(
                 NK225_OP_CODE,
                 NK225_OP_MONTH,
-                self.atm_price,
+                atm_price,
                 NK225_OP_STRIKE_SCOPE
             )
+        elif (chain_symbol == SYMBOL_NK225_MONTH2) and (self.atm_price2 != atm_price):
+            self.gateway.write_log(f"[OK] {chain_symbol} ATM価格変更: {self.atm_price2} -> {atm_price}")
+            self.atm_price2 = atm_price
             self.create_option_symbol_settings(
                 NK225_OP_CODE,
                 NK225_OP_MONTH2,
-                self.atm_price,
+                atm_price,
                 NK225_OP_STRIKE_SCOPE2
             )
 
@@ -343,23 +348,23 @@ class KabusRestApi(RestClient):
         # 生成 call option symbol strike_price in range [atm_price, atm_price + strike_scope] with interval 500
         for strike_price in range(atm_price - 1000, atm_price + strike_scope + 1, 1000):
             symbol_setting = f"{symbol_code}-{month}-C-{strike_price}"
-            if symbol_setting not in self.queried_symbol_settings:
+            if symbol_setting not in self.queried_symbol_settings and symbol_setting not in self.gateway.rest_rakuten_api.queried_symbol_settings:
                 self.symbol_settings.append(symbol_setting)
             # strike_price with interval 500
             strike_price += 500
             symbol_setting = f"{symbol_code}-{month}-C-{strike_price}"
-            if symbol_setting not in self.queried_symbol_settings:
+            if symbol_setting not in self.queried_symbol_settings and symbol_setting not in self.gateway.rest_rakuten_api.queried_symbol_settings:
                 self.gateway.rest_rakuten_api.symbol_settings.append(symbol_setting)
 
         # 生成 put option symbol strike_price in range [atm_price, atm_price - strike_scope] with interval -500
         for strike_price in range(atm_price + 1000, atm_price - strike_scope -1, -1000):
             symbol_setting = f"{symbol_code}-{month}-P-{strike_price}"
-            if symbol_setting not in self.queried_symbol_settings:
+            if symbol_setting not in self.queried_symbol_settings and symbol_setting not in self.gateway.rest_rakuten_api.queried_symbol_settings:
                 self.symbol_settings.append(symbol_setting)
             # strike_price with interval 500
             strike_price -= 500
             symbol_setting = f"{symbol_code}-{month}-P-{strike_price}"
-            if symbol_setting not in self.queried_symbol_settings:
+            if symbol_setting not in self.queried_symbol_settings and symbol_setting not in self.gateway.rest_rakuten_api.queried_symbol_settings:
                 self.gateway.rest_rakuten_api.symbol_settings.append(symbol_setting)
 
 
@@ -1561,8 +1566,8 @@ class RakutenRestApi(RestClient):
             on_failed=self.on_query_symbol_failed,
             extra=symbol_setting
         )
-        print(f"[__] symbol: {symbol_setting}")
-        self.gateway.write_log("[__] symbol: " + symbol_setting)
+        print(f"[__] rakuten symbol: {symbol_setting}")
+        self.gateway.write_log("[__] rakuten symbol: " + symbol_setting)
 
     def run_query_symbol_thread(self) -> None:
         """Function run in the thread"""
