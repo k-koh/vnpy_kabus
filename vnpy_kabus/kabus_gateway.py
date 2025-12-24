@@ -58,6 +58,16 @@ NK225_MONTH2               = 2602  # future
 SYMBOL_NK225_MONTH         = f"nk-{NK225_MONTH}"
 SYMBOL_NK225_MONTH2        = f"nk-{NK225_MONTH2}"
 
+# 日経平均VI指数
+NVI_CODE                  = "NVI"  # 日経平均VI指数
+NVI_MONTH                 = "vin1"  # future
+SYMBOL_NVI_MONTH          = f"nk-{NVI_MONTH}"
+
+# VIX指数
+VIX_CODE                  = "VIX"  # 日経平均VI指数
+VIX_MONTH                 = "vix0"  # future
+SYMBOL_VIX_MONTH          = f"nk-{VIX_MONTH}"
+
 
 NK225_OP_CODE             = "NK225op"  # 日経225オプション
 NK225_OP_MONTH            = 2601  # option
@@ -1382,7 +1392,9 @@ class RakutenRestApi(RestClient):
         # 日経225先物・オプション取得リスト
         self.symbol_settings: list = [
             # f"{NK225_CODE}-{NK225_MONTH}",
-            # f"{NK225_CODE}-{NK225_MONTH2}"
+            # f"{NK225_CODE}-{NK225_MONTH2}",
+            f"{NVI_CODE}-{NVI_MONTH}",
+            f"{VIX_CODE}-{VIX_MONTH}"
         ]
         self.queried_symbol_settings: list = []
         self.thread_symbol: threading.Thread = None
@@ -1544,8 +1556,8 @@ class RakutenRestApi(RestClient):
         # {'Code': 4002001, 'Message': '銘柄が見つからない'}
         # split the string into parts
         parts = symbol_setting.split("-")
-        code = parts[0]  # NK225mini, NK225op
-        month = parts[1]  # 2506
+        code = parts[0]  # NK225mini, NK225op, NVI
+        month = parts[1]  # 2506, vin1
 
         # DerivMonth: 限月はyyyyMM形式で指定します。0を指定した場合、直近限月となります。
         deriv_month = month[0:2] + "-" + month[2:4]  # '26-01'
@@ -1555,6 +1567,12 @@ class RakutenRestApi(RestClient):
         elif code in ['NK225op', 'NK225miniop']:
             op_type               = parts[2]   # P, C
             op_strike_price       = parts[3]
+        elif code in ['NVI']:
+            op_type               = "V"        # Volatility Index
+            op_strike_price       = "0"
+        elif code in ['VIX']:
+            op_type               = "V"        # VIX Index
+            op_strike_price       = "0"
 
         name = deriv_month + "-" + op_type + "-" + op_strike_price
         path: str = f"/rakutenapi/symbolname/{name}"
