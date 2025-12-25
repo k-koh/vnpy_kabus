@@ -360,22 +360,22 @@ class KabusRestApi(RestClient):
             symbol_setting = f"{symbol_code}-{month}-C-{strike_price}"
             if symbol_setting not in self.queried_symbol_settings and symbol_setting not in self.gateway.rest_rakuten_api.queried_symbol_settings:
                 self.symbol_settings.append(symbol_setting)
-            # strike_price with interval 500
-            strike_price += 500
-            symbol_setting = f"{symbol_code}-{month}-C-{strike_price}"
-            if symbol_setting not in self.queried_symbol_settings and symbol_setting not in self.gateway.rest_rakuten_api.queried_symbol_settings:
-                self.gateway.rest_rakuten_api.symbol_settings.append(symbol_setting)
+            # # strike_price with interval 500
+            # strike_price += 500
+            # symbol_setting = f"{symbol_code}-{month}-C-{strike_price}"
+            # if symbol_setting not in self.queried_symbol_settings and symbol_setting not in self.gateway.rest_rakuten_api.queried_symbol_settings:
+            #     self.gateway.rest_rakuten_api.symbol_settings.append(symbol_setting)
 
         # 生成 put option symbol strike_price in range [atm_price, atm_price - strike_scope] with interval -500
         for strike_price in range(atm_price + 1000, atm_price - strike_scope -1, -1000):
             symbol_setting = f"{symbol_code}-{month}-P-{strike_price}"
             if symbol_setting not in self.queried_symbol_settings and symbol_setting not in self.gateway.rest_rakuten_api.queried_symbol_settings:
                 self.symbol_settings.append(symbol_setting)
-            # strike_price with interval 500
-            strike_price -= 500
-            symbol_setting = f"{symbol_code}-{month}-P-{strike_price}"
-            if symbol_setting not in self.queried_symbol_settings and symbol_setting not in self.gateway.rest_rakuten_api.queried_symbol_settings:
-                self.gateway.rest_rakuten_api.symbol_settings.append(symbol_setting)
+            # # strike_price with interval 500
+            # strike_price -= 500
+            # symbol_setting = f"{symbol_code}-{month}-P-{strike_price}"
+            # if symbol_setting not in self.queried_symbol_settings and symbol_setting not in self.gateway.rest_rakuten_api.queried_symbol_settings:
+            #     self.gateway.rest_rakuten_api.symbol_settings.append(symbol_setting)
 
 
     def sign(self, request: Request) -> Request:
@@ -1431,22 +1431,22 @@ class RakutenRestApi(RestClient):
             symbol_setting = f"{symbol_code}-{month}-C-{strike_price}"
             if symbol_setting not in self.queried_symbol_settings:
                 self.symbol_settings.append(symbol_setting)
-            # strike_price with interval 500
-            strike_price += 500
-            symbol_setting = f"{symbol_code}-{month}-C-{strike_price}"
-            if symbol_setting not in self.queried_symbol_settings:
-                self.symbol_settings.append(symbol_setting)
+            # # strike_price with interval 500
+            # strike_price += 500
+            # symbol_setting = f"{symbol_code}-{month}-C-{strike_price}"
+            # if symbol_setting not in self.queried_symbol_settings:
+            #     self.symbol_settings.append(symbol_setting)
 
         # 生成 put option symbol strike_price in range [atm_price, atm_price - strike_scope] with interval -500
         for strike_price in range(atm_price + 1000, atm_price - strike_scope -1, -1000):
             symbol_setting = f"{symbol_code}-{month}-P-{strike_price}"
             if symbol_setting not in self.queried_symbol_settings:
                 self.symbol_settings.append(symbol_setting)
-            # strike_price with interval 500
-            strike_price -= 500
-            symbol_setting = f"{symbol_code}-{month}-P-{strike_price}"
-            if symbol_setting not in self.queried_symbol_settings:
-                self.symbol_settings.append(symbol_setting)
+            # # strike_price with interval 500
+            # strike_price -= 500
+            # symbol_setting = f"{symbol_code}-{month}-P-{strike_price}"
+            # if symbol_setting not in self.queried_symbol_settings:
+            #     self.symbol_settings.append(symbol_setting)
 
 
 
