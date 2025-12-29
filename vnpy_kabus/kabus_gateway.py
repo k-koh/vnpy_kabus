@@ -1204,6 +1204,13 @@ class KabusWebsocketApi(WebsocketClient):
         bid_volume_1 = packet.get("Buy1", {}).get("Qty")
         ask_price_1 = packet.get("Sell1", {}).get("Price")
         ask_volume_1 = packet.get("Sell1", {}).get("Qty")
+
+        if bid_price_1 and ask_price_1 and (ask_price_1 - bid_price_1 >= 45):
+            # 过滤点差过大的期权行情
+            contract: ContractData = symbol_contract_map.get(symbol, None)
+            if contract and contract.product == Product.OPTION:
+                return
+
         if bid_price_1 and ask_price_1 and bid_volume_1 and ask_volume_1:
             total_volume = bid_volume_1 + ask_volume_1
             if total_volume:
@@ -1387,7 +1394,7 @@ class RakutenRestApi(RestClient):
         self.trading_future_symbol: str = "nk-YYMM"
         self.atm_price: int = 0
         self.atm_price2: int = 0
-        self.option_board_data: dict = {}
+        self.n225_vi: float = 0.0
 
         # 日経225先物・オプション取得リスト
         self.symbol_settings: list = [
@@ -1907,6 +1914,13 @@ class RakutenWebsocketApi(WebsocketClient):
         bid_volume_1 = float(packet.get("Buy1_Qty"))
         ask_price_1  = float(packet.get("Sell1_Price"))
         ask_volume_1 = float(packet.get("Sell1_Qty"))
+
+        if bid_price_1 and ask_price_1 and (ask_price_1 - bid_price_1 >= 45):
+            # 过滤点差过大的期权行情
+            contract: ContractData = symbol_contract_map.get(symbol, None)
+            if contract and contract.product == Product.OPTION:
+                return
+
         if bid_price_1 and ask_price_1 and bid_volume_1 and ask_volume_1:
             total_volume = bid_volume_1 + ask_volume_1
             if total_volume:
@@ -1975,6 +1989,20 @@ class RakutenWebsocketApi(WebsocketClient):
                     atm_price,
                     NK225_OP_STRIKE_SCOPE2
                 )
+
+        if symbol == SYMBOL_NVI_MONTH:
+            if tick.last_price:
+                self.gateway.rest_rakuten_api.n225_vi = tick.last_price
+                tick.n225_vi = self.gateway.rest_rakuten_api.n225_vi
+
+                #     self.gateway.rest_rakuten_api.n225_vi = tick.last_price
+                # prev_n225_vi = self.gateway.rest_rakuten_api.n225_vi
+                # if prev_n225_vi == 0.0 and self.option_engine:
+                #     prev_n225_vi = self.option_engine.get_prev_day_n225_vi(tick.datetime)
+                # if abs(tick.last_price - prev_n225_vi) < 2.0:
+                #     self.gateway.rest_rakuten_api.n225_vi = tick.last_price
+                #     tick.n225_vi = self.gateway.rest_rakuten_api.n225_vi
+
 
         # 过滤还没有收到合约数据前的行情推送
         contract: ContractData = symbol_contract_map.get(tick.symbol, None)
