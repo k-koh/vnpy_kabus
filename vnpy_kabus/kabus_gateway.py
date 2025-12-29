@@ -1999,21 +1999,22 @@ class RakutenWebsocketApi(WebsocketClient):
                     NK225_OP_STRIKE_SCOPE2
                 )
 
-        if symbol == SYMBOL_NVI_MONTH and tick.last_price:
-            prev_n225_vi = self.gateway.rest_rakuten_api.n225_vi
-            if abs(tick.last_price - prev_n225_vi) < 2.0:
-                self.gateway.rest_rakuten_api.n225_vi = tick.last_price
-
-
-        tick.n225_vi = self.gateway.rest_rakuten_api.n225_vi
         # 过滤还没有收到合约数据前的行情推送
         contract: ContractData = symbol_contract_map.get(tick.symbol, None)
         if not contract:
             return
 
-        if tick.last_price:
-            self.gateway.on_tick(copy(tick))
-
+        if symbol == SYMBOL_NVI_MONTH:
+            if tick.last_price:
+                prev_n225_vi = self.gateway.rest_rakuten_api.n225_vi
+                if abs(tick.last_price - prev_n225_vi) < 1.2:
+                    self.gateway.rest_rakuten_api.n225_vi = tick.last_price
+                    tick.n225_vi = self.gateway.rest_rakuten_api.n225_vi
+                    self.gateway.on_tick(copy(tick))
+        else:
+            if tick.last_price:
+                tick.n225_vi = self.gateway.rest_rakuten_api.n225_vi
+                self.gateway.on_tick(copy(tick))
 
 
 def change_datetime(created_time: str) -> datetime:
