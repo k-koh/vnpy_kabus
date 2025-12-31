@@ -317,12 +317,12 @@ class KabusRestApi(RestClient):
         self.eris_put_match: dict = {'symbol': None, 'strike': None, 'delta': None, 'diff': float('inf'), 'impv': None}
         # 日経225先物・オプション取得リスト
         self.symbol_settings: list = [
-            f"{NK225_CODE}-{NK225_MONTH}",
-            f"{NK225_CODE}-{NK225_MONTH2}"
+            # f"{NK225_CODE}-{NK225_MONTH}",
+            # f"{NK225_CODE}-{NK225_MONTH2}"
         ]
         self.queried_symbol_settings: list = []
         self.thread_symbol: threading.Thread = None
-        self.gateway.event_engine.register(EVENT_ATM, self.process_atm_event)
+        # self.gateway.event_engine.register(EVENT_ATM, self.process_atm_event)
 
     def process_atm_event(self, event) -> None:
         """ATM价格变动事件处理"""
@@ -520,8 +520,8 @@ class KabusRestApi(RestClient):
     def run_query_symbol_thread(self) -> None:
         """Function run in the thread"""
         self.gateway.write_log("[__] Symbol取得スレッド起動")
-        symbol_setting = self.symbol_settings.pop(0)
-        self.query_symbol(symbol_setting)
+        # symbol_setting = self.symbol_settings.pop(0)
+        # self.query_symbol(symbol_setting)
         while self.active:
             time.sleep(0.2)
             if self.symbol_settings:
@@ -1299,14 +1299,13 @@ class KabusWebsocketApi(WebsocketClient):
                     NK225_OP_STRIKE_SCOPE2
                 )
 
-        tick.n225_vi = self.gateway.rest_rakuten_api.n225_vi
-
         # 过滤还没有收到合约数据前的行情推送
         contract: ContractData = symbol_contract_map.get(tick.symbol, None)
         if not contract:
             return
 
         if tick.last_price:
+            tick.n225_vi = self.gateway.rest_rakuten_api.n225_vi
             self.gateway.on_tick(copy(tick))
 
     # Database历史Tick数据模拟实盘行情
@@ -1400,14 +1399,14 @@ class RakutenRestApi(RestClient):
 
         # 日経225先物・オプション取得リスト
         self.symbol_settings: list = [
-            # f"{NK225_CODE}-{NK225_MONTH}",
-            # f"{NK225_CODE}-{NK225_MONTH2}",
+            f"{NK225_CODE}-{NK225_MONTH}",
+            f"{NK225_CODE}-{NK225_MONTH2}",
             f"{NVI_CODE}-{NVI_MONTH}",
             f"{VIX_CODE}-{VIX_MONTH}"
         ]
         self.queried_symbol_settings: list = []
         self.thread_symbol: threading.Thread = None
-        # self.gateway.event_engine.register(EVENT_ATM, self.process_atm_event)
+        self.gateway.event_engine.register(EVENT_ATM, self.process_atm_event)
         self.gateway.event_engine.register(EVENT_VI, self.process_vi_event)
 
     def process_atm_event(self, event) -> None:
@@ -1415,21 +1414,26 @@ class RakutenRestApi(RestClient):
         atm: AtmData = event.data
         print(f"[OK] rakuten process_atm_event: {atm}")
         atm_price: int = atm.atm_strike
+        atm_price = round(atm_price / 1000) * 1000
         chain_symbol: str = atm.chain_symbol
+        chain_symbol = chain_symbol.split(".")[0]  # 去掉(nk-2601.JPX) JPX部分
         self.gateway.write_log(f"[OK] rakuten {chain_symbol} ATM価格: {atm_price}")
-        if self.atm_price != atm_price:
+        if (chain_symbol == SYMBOL_NK225_MONTH) and (self.atm_price != atm_price):
             self.gateway.write_log(f"[OK] rakuten {chain_symbol} ATM価格変更: {self.atm_price} -> {atm_price}")
             self.atm_price = atm_price
             self.create_option_symbol_settings(
                 NK225_OP_CODE,
                 NK225_OP_MONTH,
-                self.atm_price,
+                atm_price,
                 NK225_OP_STRIKE_SCOPE
             )
+        elif (chain_symbol == SYMBOL_NK225_MONTH2) and (self.atm_price2 != atm_price):
+            self.gateway.write_log(f"[OK] rakuten {chain_symbol} ATM価格変更: {self.atm_price2} -> {atm_price}")
+            self.atm_price2 = atm_price
             self.create_option_symbol_settings(
                 NK225_OP_CODE,
                 NK225_OP_MONTH2,
-                self.atm_price,
+                atm_price,
                 NK225_OP_STRIKE_SCOPE2
             )
 
