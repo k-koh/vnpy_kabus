@@ -317,12 +317,12 @@ class KabusRestApi(RestClient):
         self.eris_put_match: dict = {'symbol': None, 'strike': None, 'delta': None, 'diff': float('inf'), 'impv': None}
         # 日経225先物・オプション取得リスト
         self.symbol_settings: list = [
-            # f"{NK225_CODE}-{NK225_MONTH}",
-            # f"{NK225_CODE}-{NK225_MONTH2}"
+            f"{NK225_CODE}-{NK225_MONTH}",
+            f"{NK225_CODE}-{NK225_MONTH2}"
         ]
         self.queried_symbol_settings: list = []
         self.thread_symbol: threading.Thread = None
-        # self.gateway.event_engine.register(EVENT_ATM, self.process_atm_event)
+        self.gateway.event_engine.register(EVENT_ATM, self.process_atm_event)
 
     def process_atm_event(self, event) -> None:
         """ATM价格变动事件处理"""
@@ -1399,14 +1399,14 @@ class RakutenRestApi(RestClient):
 
         # 日経225先物・オプション取得リスト
         self.symbol_settings: list = [
-            f"{NK225_CODE}-{NK225_MONTH}",
-            f"{NK225_CODE}-{NK225_MONTH2}",
+            # f"{NK225_CODE}-{NK225_MONTH}",
+            # f"{NK225_CODE}-{NK225_MONTH2}",
             f"{NVI_CODE}-{NVI_MONTH}",
             f"{VIX_CODE}-{VIX_MONTH}"
         ]
         self.queried_symbol_settings: list = []
         self.thread_symbol: threading.Thread = None
-        self.gateway.event_engine.register(EVENT_ATM, self.process_atm_event)
+        # self.gateway.event_engine.register(EVENT_ATM, self.process_atm_event)
         self.gateway.event_engine.register(EVENT_VI, self.process_vi_event)
 
     def process_atm_event(self, event) -> None:
@@ -1441,7 +1441,7 @@ class RakutenRestApi(RestClient):
         """N225VI变动事件处理"""
         vi: ViData = event.data
         print(f"[OK] rakuten process_vi_event: {vi}")
-        self.n225_vi = vi.n225_vi
+        # self.n225_vi = vi.n225_vi
 
 
     def create_option_symbol_settings(self, symbol_code: str, month: int, atm_price: int, strike_scope: int) -> None:
@@ -2011,9 +2011,11 @@ class RakutenWebsocketApi(WebsocketClient):
         if symbol == SYMBOL_NVI_MONTH:
             if tick.last_price:
                 prev_n225_vi = self.gateway.rest_rakuten_api.n225_vi
+                if prev_n225_vi == 0:
+                    self.gateway.rest_rakuten_api.n225_vi = tick.last_price
                 if abs(tick.last_price - prev_n225_vi) < 1.2:
                     self.gateway.rest_rakuten_api.n225_vi = tick.last_price
-                    tick.n225_vi = self.gateway.rest_rakuten_api.n225_vi
+                    tick.n225_vi = tick.last_price
                     self.gateway.on_tick(copy(tick))
         else:
             if tick.last_price:
