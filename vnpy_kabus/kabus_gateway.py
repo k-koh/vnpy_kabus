@@ -77,8 +77,11 @@ NK225_WEEKLY_OP_CODE      = "NK225weeklyop"  # 日经225weekly
 NK225_WEEKLY_OP_MONTH     = 2602  # option weekly
 NK225_WEEKLY_OP_WEEK      = 1       # option weekly
 
-NK225_OP_STRIKE_SCOPE  = 9000
-NK225_OP_STRIKE_SCOPE2 = 9000
+# NK225_OP_STRIKE_SCOPE  = 9000
+# NK225_OP_STRIKE_SCOPE2 = 9000
+
+NK225_OP_STRIKE_SCOPE  = 8000
+NK225_OP_STRIKE_SCOPE2 = 12000
 
 # REST API地址
 REST_HOST: str = "http://localhost:18080"
@@ -335,6 +338,28 @@ class KabusRestApi(RestClient):
         self.gateway.write_log(f"[OK] {chain_symbol} ATM価格: {atm_price}")
         if (chain_symbol == SYMBOL_NK225_MONTH) and (self.atm_price != atm_price):
             self.gateway.write_log(f"[OK] {chain_symbol} ATM価格変更: {self.atm_price} -> {atm_price}")
+            if atm_price > self.atm_price:
+                # ATM価格上昇の場合、一番小さいのCallとPutオプション銘柄をクリア
+                c_strike_price = self.atm_price - 1000
+                symbol_setting = f"{NK225_OP_CODE}-{NK225_OP_MONTH}-C-{c_strike_price}" # ex. NK225op-2603-C-52000 (ATM: 53000)
+                symbol = self.get_symbol_from_setting(symbol_setting) # ex. nk-2603-C-52000
+                self.unregister_symbol(symbol)
+
+                p_strike_price = self.atm_price - NK225_OP_STRIKE_SCOPE
+                symbol_setting = f"{NK225_OP_CODE}-{NK225_OP_MONTH}-P-{p_strike_price}" # ex. NK225op-2603-P-41000
+                symbol = self.get_symbol_from_setting(symbol_setting) # ex. nk-2603-P-41000
+                self.unregister_symbol(symbol)
+            else:
+                # ATM価格下降の場合、一番大きいのCallとPutオプション銘柄をクリア
+                c_strike_price = self.atm_price + NK225_OP_STRIKE_SCOPE
+                symbol_setting = f"{NK225_OP_CODE}-{NK225_OP_MONTH}-C-{c_strike_price}" # ex. NK225op-2603-C-65000
+                symbol = self.get_symbol_from_setting(symbol_setting) # ex. nk-2603-C-65000
+                self.unregister_symbol(symbol)
+
+                p_strike_price = self.atm_price + 1000
+                symbol_setting = f"{NK225_OP_CODE}-{NK225_OP_MONTH}-P-{p_strike_price}" # ex. NK225op-2603-P-54000 (ATM: 53000)
+                symbol = self.get_symbol_from_setting(symbol_setting) # ex. nk-2603-P-54000
+                self.unregister_symbol(symbol)
             self.atm_price = atm_price
             self.create_option_symbol_settings(
                 NK225_OP_CODE,
@@ -344,6 +369,28 @@ class KabusRestApi(RestClient):
             )
         elif (chain_symbol == SYMBOL_NK225_MONTH2) and (self.atm_price2 != atm_price):
             self.gateway.write_log(f"[OK] {chain_symbol} ATM価格変更: {self.atm_price2} -> {atm_price}")
+            if atm_price > self.atm_price2:
+                # ATM価格上昇の場合、一番小さいのCallとPutオプション銘柄をクリア
+                c_strike_price = self.atm_price2 - 1000
+                symbol_setting = f"{NK225_OP_CODE}-{NK225_OP_MONTH2}-C-{c_strike_price}" # ex. NK225op-2603-C-52000 (ATM: 53000)
+                symbol = self.get_symbol_from_setting(symbol_setting) # ex. nk-2603-C-52000
+                self.unregister_symbol(symbol)
+
+                p_strike_price = self.atm_price2 - NK225_OP_STRIKE_SCOPE2
+                symbol_setting = f"{NK225_OP_CODE}-{NK225_OP_MONTH2}-P-{p_strike_price}" # ex. NK225op-2603-P-41000
+                symbol = self.get_symbol_from_setting(symbol_setting) # ex. nk-2603-P-41000
+                self.unregister_symbol(symbol)
+            else:
+                # ATM価格下降の場合、一番大きいのCallとPutオプション銘柄をクリア
+                c_strike_price = self.atm_price2 + NK225_OP_STRIKE_SCOPE2
+                symbol_setting = f"{NK225_OP_CODE}-{NK225_OP_MONTH2}-C-{c_strike_price}" # ex. NK225op-2603-C-65000
+                symbol = self.get_symbol_from_setting(symbol_setting) # ex. nk-2603-C-65000
+                self.unregister_symbol(symbol)
+
+                p_strike_price = self.atm_price2 + 1000
+                symbol_setting = f"{NK225_OP_CODE}-{NK225_OP_MONTH2}-P-{p_strike_price}" # ex. NK225op-2603-P-54000 (ATM: 53000)
+                symbol = self.get_symbol_from_setting(symbol_setting) # ex. nk-2603-P-54000
+                self.unregister_symbol(symbol)
             self.atm_price2 = atm_price
             self.create_option_symbol_settings(
                 NK225_OP_CODE,
@@ -446,6 +493,33 @@ class KabusRestApi(RestClient):
         else:
             self.gateway.write_log("[NG] トークン取得")
 
+    def unregister_symbol(self, symbol: str):
+        """Tickデータ受信解除"""
+        symbol_ksb = SYMBOL_VT2KBS.get(symbol, None)
+        if symbol_ksb is None:
+            self.gateway.write_log(f"[NG] Tickデータ受信解除 銘柄コード変換：{symbol}")
+            return
+
+        # symbol = '160060023'
+        market = '2' # 1: 東証、3: 名証、5: 福証、6: 札証、2: 日通し、23: 日中、24: 夜間
+        data = {'Symbols':
+            [
+                {'Symbol': symbol_ksb, 'Exchange': market}
+            ]}
+
+        path: str = "/kabusapi/unregister"
+
+        self.add_request(
+            method="PUT",
+            path=path,
+            callback=self.on_unregister_symbol,
+            data=data,
+            on_failed=self.on_unregister_failed,
+            extra=symbol
+        )
+        print(f"[__] unregister_symbol: {symbol}")
+        self.gateway.write_log("[__] unregister: " + symbol)
+
     def unregister_all(self):
         """全銘柄登録解除"""
         path: str = "/kabusapi/unregister/all"
@@ -457,6 +531,30 @@ class KabusRestApi(RestClient):
             on_failed=self.on_unregister_all_failed
         )
         print("[__] unregister_all")
+
+    def on_unregister_symbol(self, data: dict, request: Request) -> None:
+        """Tickデータ受信登録成功"""
+        print(f"on_register_symbol: count={len(data['RegistList'])}")
+        # for s in data["RegistList"]:
+        #     pprint.pprint(s)
+        symbol = request.extra
+        # remove symbol from queried_symbol_settings
+        symbol_setting = self.get_setting_from_symbol(symbol)
+        self.queried_symbol_settings.remove(symbol_setting)
+
+        msg = f"[OK] unregister: {symbol} (count={len(data['RegistList'])})"
+        print(msg)
+        self.gateway.write_log(msg)
+
+    def on_unregister_failed(self, status_code: int, request: Request) -> None:
+        """Tickデータ受信登録失敗"""
+        symbol = request.extra
+        msg = f"[NG] unregister: {symbol}，状态码：{status_code}，信息：{request.response.text}"
+        print(msg)
+        self.gateway.write_log(msg)
+        # retry register symbol
+        time.sleep(0.2)
+        self.unregister_symbol(symbol)
 
     def on_query_token_failed(self, status_code: int, request: Request):
         """トークン発行失敗"""
@@ -786,6 +884,14 @@ class KabusRestApi(RestClient):
         symbol = "-".join(parts)
         return symbol
 
+    def get_setting_from_symbol(self, symbol: str) -> str:
+        """从symbol_command中获取symbol"""
+        parts = symbol.split("-")
+        parts[0] = NK225_OP_CODE
+        # partsを結合してsymbolを作成
+        symbol_setting = "-".join(parts)
+        return symbol_setting
+
     def on_query_symbol(self, data: dict, request: Request) -> None:
         """銘柄コード取得成功"""
         symbol_setting = request.extra # ex. NK225op-2512-P-47000
@@ -794,7 +900,7 @@ class KabusRestApi(RestClient):
         symbol_kbs = data["Symbol"] # ex. 180247018
         symbol = self.get_symbol_from_setting(symbol_setting) # ex. nk-2512-P-47000
         SYMBOL_VT2KBS[symbol] = symbol_kbs
-        msg = f"[OK] symbol: {symbol_setting} -> {symbol_kbs}"
+        msg = f"[OK] symbol: {symbol_setting} ({symbol_kbs})"
         self.gateway.write_log(msg)
         print(f"on_query_symbol: {symbol_setting} {data}")
         # 銘柄情報取得
