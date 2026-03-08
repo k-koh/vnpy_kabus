@@ -37,6 +37,8 @@ from vnpy.trader.object import (
     BarData, AtmData, ViData
 )
 from vnpy.trader.event import EVENT_TIMER, EVENT_ATM, EVENT_VI
+from vnpy.event import Event
+from vnpy_optionmaster.base import EVENT_OPTION_INSTRUMENT_REMOVE
 
 from vnpy_websocket import WebsocketClient
 from vnpy_rest import Request, RestClient
@@ -53,8 +55,8 @@ RKT_CallOptions = "C"
 
 # 限月指定
 NK225_CODE                = "NK225mini"  # 日经225mini
-NK225_MONTH               = 2602  # future
-NK225_MONTH2               = 2603  # future
+NK225_MONTH               = 2603  # future
+NK225_MONTH2               = 2604  # future
 SYMBOL_NK225_MONTH         = f"nk-{NK225_MONTH}"
 SYMBOL_NK225_MONTH2        = f"nk-{NK225_MONTH2}"
 
@@ -70,8 +72,8 @@ SYMBOL_VIX_MONTH          = f"nk-{VIX_MONTH}"
 
 
 NK225_OP_CODE             = "NK225op"  # 日経225オプション
-NK225_OP_MONTH            = 2602  # option
-NK225_OP_MONTH2            = 2603  # option
+NK225_OP_MONTH            = 2603  # option
+NK225_OP_MONTH2            = 2604  # option
 
 NK225_WEEKLY_OP_CODE      = "NK225weeklyop"  # 日经225weekly
 NK225_WEEKLY_OP_MONTH     = 2602  # option weekly
@@ -80,8 +82,8 @@ NK225_WEEKLY_OP_WEEK      = 1       # option weekly
 # NK225_OP_STRIKE_SCOPE  = 9000
 # NK225_OP_STRIKE_SCOPE2 = 9000
 
-NK225_OP_STRIKE_SCOPE  = 8000
-NK225_OP_STRIKE_SCOPE2 = 12000
+NK225_OP_STRIKE_SCOPE = 7000
+NK225_OP_STRIKE_SCOPE2  = 13000
 
 # REST API地址
 REST_HOST: str = "http://localhost:18080"
@@ -534,13 +536,25 @@ class KabusRestApi(RestClient):
 
     def on_unregister_symbol(self, data: dict, request: Request) -> None:
         """Tickデータ受信登録成功"""
-        print(f"on_register_symbol: count={len(data['RegistList'])}")
+        print(f"on_unregister_symbol: count={len(data['RegistList'])}")
         # for s in data["RegistList"]:
         #     pprint.pprint(s)
         symbol = request.extra
         # remove symbol from queried_symbol_settings
         symbol_setting = self.get_setting_from_symbol(symbol)
-        self.queried_symbol_settings.remove(symbol_setting)
+        if symbol_setting in self.queried_symbol_settings:
+            self.queried_symbol_settings.remove(symbol_setting)
+
+        # remove symbol from symbol_contract_map
+        if symbol in symbol_contract_map:
+            print(f"[OK] remove symbol from symbol_contract_map: {symbol}")
+            del symbol_contract_map[symbol]
+
+        # Fire event to remove instrument from option master
+        vt_symbol = f"{symbol}.JPX"
+        event = Event(EVENT_OPTION_INSTRUMENT_REMOVE, vt_symbol)
+        print(f"[OK] Fire event to Removing instrument from option master: {vt_symbol}")
+        self.gateway.event_engine.put(event)
 
         msg = f"[OK] unregister: {symbol} (count={len(data['RegistList'])})"
         print(msg)
@@ -2116,13 +2130,16 @@ class RakutenWebsocketApi(WebsocketClient):
 
         if symbol == SYMBOL_NVI_MONTH:
             if tick.last_price:
-                prev_n225_vi = self.gateway.rest_rakuten_api.n225_vi
-                if prev_n225_vi == 0:
-                    self.gateway.rest_rakuten_api.n225_vi = tick.last_price
-                if abs(tick.last_price - prev_n225_vi) < 1.2:
-                    self.gateway.rest_rakuten_api.n225_vi = tick.last_price
-                    tick.n225_vi = tick.last_price
-                    self.gateway.on_tick(copy(tick))
+                self.gateway.rest_rakuten_api.n225_vi = tick.last_price
+                tick.n225_vi = tick.last_price
+                self.gateway.on_tick(copy(tick))
+                # prev_n225_vi = self.gateway.rest_rakuten_api.n225_vi
+                # if prev_n225_vi == 0:
+                #     self.gateway.rest_rakuten_api.n225_vi = tick.last_price
+                # if abs(tick.last_price - prev_n225_vi) < 1.2:
+                #     self.gateway.rest_rakuten_api.n225_vi = tick.last_price
+                #     tick.n225_vi = tick.last_price
+                #     self.gateway.on_tick(copy(tick))
         else:
             if tick.last_price:
                 tick.n225_vi = self.gateway.rest_rakuten_api.n225_vi
