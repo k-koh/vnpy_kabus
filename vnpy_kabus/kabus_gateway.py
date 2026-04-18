@@ -180,7 +180,8 @@ class KabusGateway(BaseGateway):
     default_name: str = "KBS"
 
     default_setting: Dict[str, Any] = {
-        "API Key": ""
+        "API Key": "",
+        "Simulation Mode": ["False", "True"]
     }
 
     exchanges: Exchange = [Exchange.JPX]
@@ -205,9 +206,15 @@ class KabusGateway(BaseGateway):
     def connect(self, setting: dict) -> None:
         """连接交易接口"""
         key: str = setting["API Key"]
+        self.simulation_mode: bool = setting.get("Simulation Mode", "False") == "True"
 
         self.rest_rakuten_api.connect(key)
         self.ws_rakuten_api.connect(key)
+
+        if self.simulation_mode:
+            self.write_log("[OK] シミュレーションモード: KBS/Rakuten 接続スキップ")
+            return
+
         self.rest_api.connect(key)
         self.ws_api.connect(key)
 
@@ -274,6 +281,8 @@ class KabusGateway(BaseGateway):
         if self.count < 15:
             return
         self.count = 0
+        if getattr(self, "simulation_mode", False):
+            return
         self.ws_api.ping()
         # self.ws_rakuten_api.ping()
 
@@ -1516,8 +1525,6 @@ class RakutenRestApi(RestClient):
 
         # 日経225先物・オプション取得リスト
         self.symbol_settings: list = [
-            # f"{NK225_CODE}-{NK225_MONTH}",
-            # f"{NK225_CODE}-{NK225_MONTH2}",
             f"{NVI_CODE}-{NVI_MONTH}",
             f"{VIX_CODE}-{VIX_MONTH}"
         ]
@@ -1609,6 +1616,11 @@ class RakutenRestApi(RestClient):
         self.connect_time = (
             int(datetime.now().strftime("%y%m%d%H%M%S")) * self.order_count
         )
+
+        if getattr(self.gateway, "simulation_mode", False):
+            for s in (f"{NK225_CODE}-{NK225_MONTH}", f"{NK225_CODE}-{NK225_MONTH2}"):
+                if s not in self.symbol_settings:
+                    self.symbol_settings.insert(0, s)
 
         self.init(RAKUTEN_RSS_REST_HOST)
         self.start()
@@ -2046,17 +2058,25 @@ class RakutenWebsocketApi(WebsocketClient):
         ask_volume_1 = float(packet.get("Sell1_Qty"))
 
         if bid_price_1 and ask_price_1 and (ask_price_1 - bid_price_1 >= 45):
-            # 过滤点差过大的期权行情
-            contract: ContractData = symbol_contract_map.get(symbol, None)
-            if contract and contract.product == Product.OPTION:
-                return
+            # 点差过大: シミュレーションモードでは CurrentPrice を使用 (先物/オプション)
+            if getattr(self.gateway, "simulation_mode", False):
+                last_price = float(packet.get("CurrentPrice"))
+            else:
+                # 过滤点差过大的期权行情
+                contract: ContractData = symbol_contract_map.get(symbol, None)
+                if contract and contract.product == Product.OPTION:
+                    return
 
-        if bid_price_1 and ask_price_1 and bid_volume_1 and ask_volume_1:
+        if last_price is None and bid_price_1 and ask_price_1 and bid_volume_1 and ask_volume_1:
             total_volume = bid_volume_1 + ask_volume_1
             if total_volume:
                 last_price = bid_price_1 + (ask_price_1 - bid_price_1) * bid_volume_1 / total_volume
         if last_price is None:
             last_price = float(packet.get("CurrentPrice"))
+
+        if getattr(self.gateway, "simulation_mode", False) and last_price:
+            bid_price_1 = last_price
+            ask_price_1 = last_price
 
         volume = float(packet.get("TradingVolume"))
         turnover = float(packet.get("TradingValue"))
