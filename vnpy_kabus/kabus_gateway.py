@@ -55,8 +55,8 @@ RKT_CallOptions = "C"
 
 # 限月指定
 NK225_CODE                = "NK225mini"  # 日经225mini
-NK225_MONTH               = 2608  # future
-NK225_MONTH2              = 2609  # future
+NK225_MONTH               = 2609  # future
+NK225_MONTH2              = 2610  # future
 SYMBOL_NK225_MONTH         = f"nk-{NK225_MONTH}"
 SYMBOL_NK225_MONTH2        = f"nk-{NK225_MONTH2}"
 
@@ -72,8 +72,8 @@ SYMBOL_VIX_MONTH          = f"nk-{VIX_MONTH}"
 
 
 NK225_OP_CODE             = "NK225op"  # 日経225オプション
-NK225_OP_MONTH            = 2608  # option
-NK225_OP_MONTH2           = 2609  # option
+NK225_OP_MONTH            = 2609  # option
+NK225_OP_MONTH2           = 2610  # option
 
 NK225_WEEKLY_OP_CODE      = "NK225weeklyop"  # 日经225weekly
 NK225_WEEKLY_OP_MONTH     = 2602  # option weekly
