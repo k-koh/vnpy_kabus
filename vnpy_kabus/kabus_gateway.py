@@ -1370,6 +1370,8 @@ class KabusWebsocketApi(WebsocketClient):
             pre_close=packet.get("PreviousClose"),
             last_price=last_price,
             last_volume=volume,
+            # last_price は上の板加重midなので、約定値そのものは別に持つ
+            trade_price=packet.get("CurrentPrice") or 0,
 
             ask_price_1=packet.get("Sell1", {}).get("Price"),
             ask_volume_1=packet.get("Sell1", {}).get("Qty"),
