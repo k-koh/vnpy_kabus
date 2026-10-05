@@ -79,8 +79,12 @@ NK225_WEEKLY_OP_CODE      = "NK225weeklyop"  # 日经225weekly
 NK225_WEEKLY_OP_MONTH     = 2602  # option weekly
 NK225_WEEKLY_OP_WEEK      = 1       # option weekly
 
-NK225_OP_STRIKE_SCOPE  = 9000
-NK225_OP_STRIKE_SCOPE2 = 11000
+# 権利行使価格をATMから上下いくつまで取るか。コール側（ATMより上）と
+# プット側（ATMより下）を別々に決められる。1000円刻みで作る。
+NK225_OP_STRIKE_SCOPE_CALL  = 5000     # 1限月 コール側
+NK225_OP_STRIKE_SCOPE_PUT   = 5000     # 1限月 プット側
+NK225_OP_STRIKE_SCOPE2_CALL = 15000    # 2限月 コール側
+NK225_OP_STRIKE_SCOPE2_PUT  = 15000    # 2限月 プット側
 
 # REST API地址
 REST_HOST: str = "http://localhost:18080"
@@ -347,13 +351,13 @@ class KabusRestApi(RestClient):
                 symbol = self.get_symbol_from_setting(symbol_setting) # ex. nk-2603-C-52000
                 self.unregister_symbol(symbol)
 
-                p_strike_price = self.atm_price - NK225_OP_STRIKE_SCOPE
+                p_strike_price = self.atm_price - NK225_OP_STRIKE_SCOPE_PUT
                 symbol_setting = f"{NK225_OP_CODE}-{NK225_OP_MONTH}-P-{p_strike_price}" # ex. NK225op-2603-P-41000
                 symbol = self.get_symbol_from_setting(symbol_setting) # ex. nk-2603-P-41000
                 self.unregister_symbol(symbol)
             else:
                 # ATM価格下降の場合、一番大きいのCallとPutオプション銘柄をクリア
-                c_strike_price = self.atm_price + NK225_OP_STRIKE_SCOPE
+                c_strike_price = self.atm_price + NK225_OP_STRIKE_SCOPE_CALL
                 symbol_setting = f"{NK225_OP_CODE}-{NK225_OP_MONTH}-C-{c_strike_price}" # ex. NK225op-2603-C-65000
                 symbol = self.get_symbol_from_setting(symbol_setting) # ex. nk-2603-C-65000
                 self.unregister_symbol(symbol)
@@ -367,7 +371,8 @@ class KabusRestApi(RestClient):
                 NK225_OP_CODE,
                 NK225_OP_MONTH,
                 atm_price,
-                NK225_OP_STRIKE_SCOPE
+                NK225_OP_STRIKE_SCOPE_CALL,
+                NK225_OP_STRIKE_SCOPE_PUT
             )
         elif (chain_symbol == SYMBOL_NK225_MONTH2) and (self.atm_price2 != atm_price):
             self.gateway.write_log(f"[OK] {chain_symbol} ATM価格変更: {self.atm_price2} -> {atm_price}")
@@ -378,13 +383,13 @@ class KabusRestApi(RestClient):
                 symbol = self.get_symbol_from_setting(symbol_setting) # ex. nk-2603-C-52000
                 self.unregister_symbol(symbol)
 
-                p_strike_price = self.atm_price2 - NK225_OP_STRIKE_SCOPE2
+                p_strike_price = self.atm_price2 - NK225_OP_STRIKE_SCOPE2_PUT
                 symbol_setting = f"{NK225_OP_CODE}-{NK225_OP_MONTH2}-P-{p_strike_price}" # ex. NK225op-2603-P-41000
                 symbol = self.get_symbol_from_setting(symbol_setting) # ex. nk-2603-P-41000
                 self.unregister_symbol(symbol)
             else:
                 # ATM価格下降の場合、一番大きいのCallとPutオプション銘柄をクリア
-                c_strike_price = self.atm_price2 + NK225_OP_STRIKE_SCOPE2
+                c_strike_price = self.atm_price2 + NK225_OP_STRIKE_SCOPE2_CALL
                 symbol_setting = f"{NK225_OP_CODE}-{NK225_OP_MONTH2}-C-{c_strike_price}" # ex. NK225op-2603-C-65000
                 symbol = self.get_symbol_from_setting(symbol_setting) # ex. nk-2603-C-65000
                 self.unregister_symbol(symbol)
@@ -398,14 +403,25 @@ class KabusRestApi(RestClient):
                 NK225_OP_CODE,
                 NK225_OP_MONTH2,
                 atm_price,
-                NK225_OP_STRIKE_SCOPE2
+                NK225_OP_STRIKE_SCOPE2_CALL,
+                NK225_OP_STRIKE_SCOPE2_PUT
             )
 
 
-    def create_option_symbol_settings(self, symbol_code: str, month: int, atm_price: int, strike_scope: int) -> None:
-        """生成option symbol settings"""
-        # 生成 call option symbol strike_price in range [atm_price, atm_price + strike_scope] with interval 500
-        for strike_price in range(atm_price - 1000, atm_price + strike_scope + 1, 1000):
+    def create_option_symbol_settings(
+        self, symbol_code: str, month: int, atm_price: int,
+        call_scope: int, put_scope: int | None = None
+    ) -> None:
+        """生成option symbol settings
+
+        call_scope … ATMより上をいくつまで取るか（コール）
+        put_scope  … ATMより下をいくつまで取るか（プット）。省略したら
+                     コールと同じ幅（これまでの動き）。
+        """
+        if put_scope is None:
+            put_scope = call_scope
+        # 生成 call option symbol strike_price in range [atm_price, atm_price + call_scope] with interval 500
+        for strike_price in range(atm_price - 1000, atm_price + call_scope + 1, 1000):
             symbol_setting = f"{symbol_code}-{month}-C-{strike_price}"
             if symbol_setting not in self.queried_symbol_settings and symbol_setting not in self.gateway.rest_rakuten_api.queried_symbol_settings:
                 self.symbol_settings.append(symbol_setting)
@@ -415,8 +431,8 @@ class KabusRestApi(RestClient):
             # if symbol_setting not in self.queried_symbol_settings and symbol_setting not in self.gateway.rest_rakuten_api.queried_symbol_settings:
             #     self.gateway.rest_rakuten_api.symbol_settings.append(symbol_setting)
 
-        # 生成 put option symbol strike_price in range [atm_price, atm_price - strike_scope] with interval -500
-        for strike_price in range(atm_price + 1000, atm_price - strike_scope -1, -1000):
+        # 生成 put option symbol strike_price in range [atm_price, atm_price - put_scope] with interval -500
+        for strike_price in range(atm_price + 1000, atm_price - put_scope - 1, -1000):
             symbol_setting = f"{symbol_code}-{month}-P-{strike_price}"
             if symbol_setting not in self.queried_symbol_settings and symbol_setting not in self.gateway.rest_rakuten_api.queried_symbol_settings:
                 self.symbol_settings.append(symbol_setting)
@@ -1419,7 +1435,8 @@ class KabusWebsocketApi(WebsocketClient):
                     NK225_OP_CODE,
                     NK225_OP_MONTH,
                     atm_price,
-                    NK225_OP_STRIKE_SCOPE
+                    NK225_OP_STRIKE_SCOPE_CALL,
+                    NK225_OP_STRIKE_SCOPE_PUT
                 )
 
         if symbol == SYMBOL_NK225_MONTH2 and not self.gateway.rest_api.atm_price2:
@@ -1431,7 +1448,8 @@ class KabusWebsocketApi(WebsocketClient):
                     NK225_OP_CODE,
                     NK225_OP_MONTH2,
                     atm_price,
-                    NK225_OP_STRIKE_SCOPE2
+                    NK225_OP_STRIKE_SCOPE2_CALL,
+                    NK225_OP_STRIKE_SCOPE2_PUT
                 )
 
         # 过滤还没有收到合约数据前的行情推送
@@ -1558,7 +1576,8 @@ class RakutenRestApi(RestClient):
                 NK225_OP_CODE,
                 NK225_OP_MONTH,
                 atm_price,
-                NK225_OP_STRIKE_SCOPE
+                NK225_OP_STRIKE_SCOPE_CALL,
+                NK225_OP_STRIKE_SCOPE_PUT
             )
         elif (chain_symbol == SYMBOL_NK225_MONTH2) and (self.atm_price2 != atm_price):
             self.gateway.write_log(f"[OK] rakuten {chain_symbol} ATM価格変更: {self.atm_price2} -> {atm_price}")
@@ -1567,7 +1586,8 @@ class RakutenRestApi(RestClient):
                 NK225_OP_CODE,
                 NK225_OP_MONTH2,
                 atm_price,
-                NK225_OP_STRIKE_SCOPE2
+                NK225_OP_STRIKE_SCOPE2_CALL,
+                NK225_OP_STRIKE_SCOPE2_PUT
             )
 
     def process_vi_event(self, event) -> None:
@@ -1577,10 +1597,20 @@ class RakutenRestApi(RestClient):
         # self.n225_vi = vi.n225_vi
 
 
-    def create_option_symbol_settings(self, symbol_code: str, month: int, atm_price: int, strike_scope: int) -> None:
-        """生成option symbol settings"""
-        # 生成 call option symbol strike_price in range [atm_price, atm_price + strike_scope] with interval 500
-        for strike_price in range(atm_price - 1000, atm_price + strike_scope + 1, 1000):
+    def create_option_symbol_settings(
+        self, symbol_code: str, month: int, atm_price: int,
+        call_scope: int, put_scope: int | None = None
+    ) -> None:
+        """生成option symbol settings
+
+        call_scope … ATMより上をいくつまで取るか（コール）
+        put_scope  … ATMより下をいくつまで取るか（プット）。省略したら
+                     コールと同じ幅（これまでの動き）。
+        """
+        if put_scope is None:
+            put_scope = call_scope
+        # 生成 call option symbol strike_price in range [atm_price, atm_price + call_scope] with interval 500
+        for strike_price in range(atm_price - 1000, atm_price + call_scope + 1, 1000):
             symbol_setting = f"{symbol_code}-{month}-C-{strike_price}"
             if symbol_setting not in self.queried_symbol_settings:
                 self.symbol_settings.append(symbol_setting)
@@ -1590,8 +1620,8 @@ class RakutenRestApi(RestClient):
             # if symbol_setting not in self.queried_symbol_settings:
             #     self.symbol_settings.append(symbol_setting)
 
-        # 生成 put option symbol strike_price in range [atm_price, atm_price - strike_scope] with interval -500
-        for strike_price in range(atm_price + 1000, atm_price - strike_scope -1, -1000):
+        # 生成 put option symbol strike_price in range [atm_price, atm_price - put_scope] with interval -500
+        for strike_price in range(atm_price + 1000, atm_price - put_scope - 1, -1000):
             symbol_setting = f"{symbol_code}-{month}-P-{strike_price}"
             if symbol_setting not in self.queried_symbol_settings:
                 self.symbol_settings.append(symbol_setting)
@@ -2134,7 +2164,8 @@ class RakutenWebsocketApi(WebsocketClient):
                     NK225_OP_CODE,
                     NK225_OP_MONTH,
                     atm_price,
-                    NK225_OP_STRIKE_SCOPE
+                    NK225_OP_STRIKE_SCOPE_CALL,
+                    NK225_OP_STRIKE_SCOPE_PUT
                 )
 
         if symbol == SYMBOL_NK225_MONTH2 and not self.gateway.rest_rakuten_api.atm_price2:
@@ -2146,7 +2177,8 @@ class RakutenWebsocketApi(WebsocketClient):
                     NK225_OP_CODE,
                     NK225_OP_MONTH2,
                     atm_price,
-                    NK225_OP_STRIKE_SCOPE2
+                    NK225_OP_STRIKE_SCOPE2_CALL,
+                    NK225_OP_STRIKE_SCOPE2_PUT
                 )
 
         # 过滤还没有收到合约数据前的行情推送
