@@ -1226,6 +1226,12 @@ class KabusWebsocketApi(WebsocketClient):
 
         self.subscribed: Dict[str, SubscribeRequest] = {}
 
+        # 銘柄ごとの、最後に受け取った累計出来高／売買代金。kabus の PUSH は
+        # 変わった項目しか送ってこないので、入っていない回はここの値を使う
+        # （0 に落とすと、約定の無い行使価格の出来高が消えてしまう）。
+        self.last_trading_volume: Dict[str, float] = {}
+        self.last_trading_value: Dict[str, float] = {}
+
         self.start_time = datetime.utcnow().date()
         self.count = 0
 
@@ -1338,12 +1344,19 @@ class KabusWebsocketApi(WebsocketClient):
         if last_price is None:
             last_price = packet.get("CurrentPrice")
 
+        # 項目が無い＝「前回から増えていない」。0 ではないので、最後に
+        # 受け取った累計をそのまま引き継ぐ。セッションが変わって累計が戻る
+        # ときは、その回の PUSH に新しい値が入ってくるので上書きされる。
         volume = packet.get("TradingVolume")
         if volume is None:
-            volume = 0
+            volume = self.last_trading_volume.get(symbol_kbs, 0)
+        else:
+            self.last_trading_volume[symbol_kbs] = volume
         turnover = packet.get("TradingValue")
         if turnover is None:
-            turnover = 0
+            turnover = self.last_trading_value.get(symbol_kbs, 0)
+        else:
+            self.last_trading_value[symbol_kbs] = turnover
 
         open_price = packet.get("OpeningPrice")
         if open_price is None:
