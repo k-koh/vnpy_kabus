@@ -55,8 +55,8 @@ RKT_CallOptions = "C"
 
 # 限月指定
 NK225_CODE                = "NK225mini"  # 日经225mini
-NK225_MONTH               = 2610  # future
-NK225_MONTH2              = 2611  # future
+NK225_MONTH               = 2611  # future
+NK225_MONTH2              = 2612  # future
 SYMBOL_NK225_MONTH         = f"nk-{NK225_MONTH}"
 SYMBOL_NK225_MONTH2        = f"nk-{NK225_MONTH2}"
 
@@ -72,8 +72,8 @@ SYMBOL_VIX_MONTH          = f"nk-{VIX_MONTH}"
 
 
 NK225_OP_CODE             = "NK225op"  # 日経225オプション
-NK225_OP_MONTH            = 2610  # option
-NK225_OP_MONTH2           = 2611  # option
+NK225_OP_MONTH            = 2611  # option
+NK225_OP_MONTH2           = 2612  # option
 
 NK225_WEEKLY_OP_CODE      = "NK225weeklyop"  # 日经225weekly
 NK225_WEEKLY_OP_MONTH     = 2602  # option weekly
@@ -81,10 +81,20 @@ NK225_WEEKLY_OP_WEEK      = 1       # option weekly
 
 # 権利行使価格をATMから上下いくつまで取るか。コール側（ATMより上）と
 # プット側（ATMより下）を別々に決められる。1000円刻みで作る。
-NK225_OP_STRIKE_SCOPE_CALL  = 5000     # 1限月 コール側
-NK225_OP_STRIKE_SCOPE_PUT   = 5000     # 1限月 プット側
-NK225_OP_STRIKE_SCOPE2_CALL = 15000    # 2限月 コール側
-NK225_OP_STRIKE_SCOPE2_PUT  = 15000    # 2限月 プット側
+NK225_OP_STRIKE_SCOPE2_CALL  = 5000     # 1限月 コール側
+NK225_OP_STRIKE_SCOPE2_PUT   = 9000     # 1限月 プット側
+
+NK225_OP_STRIKE_SCOPE_CALL = 11000    # 2限月 コール側
+NK225_OP_STRIKE_SCOPE_PUT  = 15000    # 2限月 プット側
+
+# kabus の時価PUSHは登録50銘柄まで。上の SCOPE はその枠に収まる幅にしてある。
+# そこに入らない外側のウィングは、Excelの楽天RSSシートから受ける（アドインが
+# 2秒おきにシートを読んで流してくる）。kabus 側より遅いので、板が薄くて動きの
+# 少ない深いOTMだけをこちらに回す。
+NK225_OP_RSS_SCOPE_CALL   = 20000     # 1限月 コール側（ATMから上）
+NK225_OP_RSS_SCOPE_PUT    = 20000     # 1限月 プット側（ATMから下）
+NK225_OP_RSS_SCOPE2_CALL  = 20000     # 2限月 コール側
+NK225_OP_RSS_SCOPE2_PUT   = 20000     # 2限月 プット側
 
 # REST API地址
 REST_HOST: str = "http://localhost:18080"
@@ -185,7 +195,11 @@ class KabusGateway(BaseGateway):
 
     default_setting: Dict[str, Any] = {
         "API Key": "",
-        "market_closed_mode": ["False", "True"]
+        "market_closed_mode": ["False", "True"],
+        # kabus の時価PUSHは登録50銘柄まで。そこに入らない外側の行使価格を
+        # 楽天RSS（Excelアドイン）から受けるかどうか。Excel と
+        # マーケットスピードII を立ち上げていないときは False にする。
+        "rakuten_rss": ["True", "False"]
     }
 
     exchanges: Exchange = [Exchange.JPX]
@@ -211,9 +225,15 @@ class KabusGateway(BaseGateway):
         """连接交易接口"""
         key: str = setting["API Key"]
         self.market_closed_mode: bool = setting.get("market_closed_mode", "False") == "True"
+        self.rakuten_rss: bool = setting.get("rakuten_rss", "True") == "True"
 
-        # self.rest_rakuten_api.connect(key)
-        # self.ws_rakuten_api.connect(key)
+        # 楽天RSSは、kabus の50銘柄に入らない外側の行使価格を受け持つ。
+        # 休場モードでは先物もこちらから取るので、そのときも繋ぐ。
+        if self.rakuten_rss or self.market_closed_mode:
+            self.rest_rakuten_api.connect(key)
+            self.ws_rakuten_api.connect(key)
+        else:
+            self.write_log("[__] 楽天RSSは使いません（kabusの50銘柄のみ）")
 
         self.rest_api.connect(key)
         self.ws_api.connect(key)
@@ -355,12 +375,14 @@ class KabusRestApi(RestClient):
                 symbol_setting = f"{NK225_OP_CODE}-{NK225_OP_MONTH}-P-{p_strike_price}" # ex. NK225op-2603-P-41000
                 symbol = self.get_symbol_from_setting(symbol_setting) # ex. nk-2603-P-41000
                 self.unregister_symbol(symbol)
+                self.handoff_to_rakuten(symbol_setting)
             else:
                 # ATM価格下降の場合、一番大きいのCallとPutオプション銘柄をクリア
                 c_strike_price = self.atm_price + NK225_OP_STRIKE_SCOPE_CALL
                 symbol_setting = f"{NK225_OP_CODE}-{NK225_OP_MONTH}-C-{c_strike_price}" # ex. NK225op-2603-C-65000
                 symbol = self.get_symbol_from_setting(symbol_setting) # ex. nk-2603-C-65000
                 self.unregister_symbol(symbol)
+                self.handoff_to_rakuten(symbol_setting)
 
                 p_strike_price = self.atm_price + 1000
                 symbol_setting = f"{NK225_OP_CODE}-{NK225_OP_MONTH}-P-{p_strike_price}" # ex. NK225op-2603-P-54000 (ATM: 53000)
@@ -372,7 +394,9 @@ class KabusRestApi(RestClient):
                 NK225_OP_MONTH,
                 atm_price,
                 NK225_OP_STRIKE_SCOPE_CALL,
-                NK225_OP_STRIKE_SCOPE_PUT
+                NK225_OP_STRIKE_SCOPE_PUT,
+                NK225_OP_RSS_SCOPE_CALL,
+                NK225_OP_RSS_SCOPE_PUT
             )
         elif (chain_symbol == SYMBOL_NK225_MONTH2) and (self.atm_price2 != atm_price):
             self.gateway.write_log(f"[OK] {chain_symbol} ATM価格変更: {self.atm_price2} -> {atm_price}")
@@ -387,12 +411,14 @@ class KabusRestApi(RestClient):
                 symbol_setting = f"{NK225_OP_CODE}-{NK225_OP_MONTH2}-P-{p_strike_price}" # ex. NK225op-2603-P-41000
                 symbol = self.get_symbol_from_setting(symbol_setting) # ex. nk-2603-P-41000
                 self.unregister_symbol(symbol)
+                self.handoff_to_rakuten(symbol_setting)
             else:
                 # ATM価格下降の場合、一番大きいのCallとPutオプション銘柄をクリア
                 c_strike_price = self.atm_price2 + NK225_OP_STRIKE_SCOPE2_CALL
                 symbol_setting = f"{NK225_OP_CODE}-{NK225_OP_MONTH2}-C-{c_strike_price}" # ex. NK225op-2603-C-65000
                 symbol = self.get_symbol_from_setting(symbol_setting) # ex. nk-2603-C-65000
                 self.unregister_symbol(symbol)
+                self.handoff_to_rakuten(symbol_setting)
 
                 p_strike_price = self.atm_price2 + 1000
                 symbol_setting = f"{NK225_OP_CODE}-{NK225_OP_MONTH2}-P-{p_strike_price}" # ex. NK225op-2603-P-54000 (ATM: 53000)
@@ -404,22 +430,35 @@ class KabusRestApi(RestClient):
                 NK225_OP_MONTH2,
                 atm_price,
                 NK225_OP_STRIKE_SCOPE2_CALL,
-                NK225_OP_STRIKE_SCOPE2_PUT
+                NK225_OP_STRIKE_SCOPE2_PUT,
+                NK225_OP_RSS_SCOPE2_CALL,
+                NK225_OP_RSS_SCOPE2_PUT
             )
 
 
     def create_option_symbol_settings(
         self, symbol_code: str, month: int, atm_price: int,
-        call_scope: int, put_scope: int | None = None
+        call_scope: int, put_scope: int | None = None,
+        rss_call_scope: int = 0, rss_put_scope: int = 0
     ) -> None:
         """生成option symbol settings
 
         call_scope … ATMより上をいくつまで取るか（コール）
         put_scope  … ATMより下をいくつまで取るか（プット）。省略したら
                      コールと同じ幅（これまでの動き）。
+        rss_*_scope … kabus の窓の外から、ここまでを楽天RSSから取る。
+                      kabus のPUSHは50銘柄までなので、入りきらないぶん。
         """
         if put_scope is None:
             put_scope = call_scope
+
+        # kabus の窓の外側を楽天RSSへ。内側と重ならないよう、kabus の端の
+        # 1つ外から始める。
+        self._add_rss_option_settings(
+            symbol_code, month, atm_price,
+            call_scope, put_scope, rss_call_scope, rss_put_scope,
+        )
+
         # 生成 call option symbol strike_price in range [atm_price, atm_price + call_scope] with interval 500
         for strike_price in range(atm_price - 1000, atm_price + call_scope + 1, 1000):
             symbol_setting = f"{symbol_code}-{month}-C-{strike_price}"
@@ -442,6 +481,37 @@ class KabusRestApi(RestClient):
             # if symbol_setting not in self.queried_symbol_settings and symbol_setting not in self.gateway.rest_rakuten_api.queried_symbol_settings:
             #     self.gateway.rest_rakuten_api.symbol_settings.append(symbol_setting)
 
+
+    def _add_rss_option_settings(
+        self, symbol_code: str, month: int, atm_price: int,
+        call_scope: int, put_scope: int,
+        rss_call_scope: int, rss_put_scope: int,
+    ) -> None:
+        """kabus の窓の外側を、楽天RSSの取得リストへ積む。
+
+        kabus は ATM-1000 〜 ATM+call_scope（コール）、ATM+1000 〜
+        ATM-put_scope（プット）を持っているので、その1つ外から rss_*_scope
+        までを楽天RSSに任せる。深いOTMほど板が動かないので、2秒おきの更新で
+        足りる。
+        """
+        rakuten = getattr(self.gateway, "rest_rakuten_api", None)
+        if rakuten is None or not getattr(self.gateway, "rakuten_rss", False):
+            return
+
+        outer: list[str] = []
+        if rss_call_scope > call_scope:
+            for strike_price in range(
+                atm_price + call_scope + 1000, atm_price + rss_call_scope + 1, 1000
+            ):
+                outer.append(f"{symbol_code}-{month}-C-{strike_price}")
+        if rss_put_scope > put_scope:
+            for strike_price in range(
+                atm_price - put_scope - 1000, atm_price - rss_put_scope - 1, -1000
+            ):
+                outer.append(f"{symbol_code}-{month}-P-{strike_price}")
+
+        for symbol_setting in outer:
+            rakuten.ensure_symbol(symbol_setting)
 
     def sign(self, request: Request) -> Request:
         """生成FTX签名"""
@@ -510,6 +580,20 @@ class KabusRestApi(RestClient):
             self.thread_order.start()
         else:
             self.gateway.write_log("[NG] トークン取得")
+
+    def serves_symbol(self, symbol: str) -> bool:
+        """この銘柄を kabus 側で受けているか（楽天RSSの重複を捨てるため）。"""
+        return self.get_setting_from_symbol(symbol) in self.queried_symbol_settings
+
+    def handoff_to_rakuten(self, symbol_setting: str) -> None:
+        """kabus の窓から外れた銘柄を、楽天RSS側に引き継ぐ。
+
+        kabus の登録解除は契約も消す（OptionMasterからも外れる）ので、
+        そのままだと銘柄ごと見えなくなる。RSS側で引き直してもらう。
+        """
+        rakuten = getattr(self.gateway, "rest_rakuten_api", None)
+        if rakuten is not None and getattr(self.gateway, "rakuten_rss", False):
+            rakuten.ensure_symbol(symbol_setting)
 
     def unregister_symbol(self, symbol: str):
         """Tickデータ受信解除"""
@@ -1436,7 +1520,9 @@ class KabusWebsocketApi(WebsocketClient):
                     NK225_OP_MONTH,
                     atm_price,
                     NK225_OP_STRIKE_SCOPE_CALL,
-                    NK225_OP_STRIKE_SCOPE_PUT
+                    NK225_OP_STRIKE_SCOPE_PUT,
+                    NK225_OP_RSS_SCOPE_CALL,
+                    NK225_OP_RSS_SCOPE_PUT
                 )
 
         if symbol == SYMBOL_NK225_MONTH2 and not self.gateway.rest_api.atm_price2:
@@ -1449,7 +1535,9 @@ class KabusWebsocketApi(WebsocketClient):
                     NK225_OP_MONTH2,
                     atm_price,
                     NK225_OP_STRIKE_SCOPE2_CALL,
-                    NK225_OP_STRIKE_SCOPE2_PUT
+                    NK225_OP_STRIKE_SCOPE2_PUT,
+                    NK225_OP_RSS_SCOPE2_CALL,
+                    NK225_OP_RSS_SCOPE2_PUT
                 )
 
         # 过滤还没有收到合约数据前的行情推送
@@ -1928,6 +2016,28 @@ class RakutenRestApi(RestClient):
         self.query_contract(symbol)
 
 
+    def ensure_symbol(self, symbol_setting: str) -> None:
+        """この銘柄を楽天RSSで受けられる状態にする。
+
+        まだ引いていなければ取得待ちの列に積む。すでに引いてあるなら、kabus
+        側の登録解除で契約が消えている場合があるので、契約を引き直して受信
+        登録をやり直す（RSSには1銘柄ずつの解除APIが無いので、重複登録は
+        受信側で捨てる）。
+        """
+        if symbol_setting in self.symbol_settings:
+            return
+
+        if symbol_setting in self.queried_symbol_settings:
+            symbol: str = self.get_symbol_from_setting(symbol_setting)
+            if SYMBOL_VT2KBS.get(symbol):
+                self.query_contract(symbol)
+                self.register_symbol(symbol)
+                return
+            # 銘柄コードが取れていない＝引き直しが要る
+            self.queried_symbol_settings.remove(symbol_setting)
+
+        self.symbol_settings.append(symbol_setting)
+
     def register_symbol(self, symbol: str):
         """Tickデータ受信登録"""
         symbol_ksb = SYMBOL_VT2KBS.get(symbol, None)
@@ -2086,6 +2196,11 @@ class RakutenWebsocketApi(WebsocketClient):
         symbol = symbol_kbs2vt(SYMBOL_VT2KBS, symbol_kbs)
         if symbol is None:
             self.gateway.write_log(f"[NG] rakuten 推送数据 銘柄コード変換：{symbol_kbs}")
+            return
+
+        # kabus に登録されている銘柄は、そちらの速いPUSHで受けている。RSSは
+        # 2秒おきなので、同じ銘柄を両方から入れると遅い値で上書きしてしまう。
+        if self.gateway.rest_api.serves_symbol(symbol):
             return
 
         # if symbol != self.gateway.rest_api.trading_future_symbol:
