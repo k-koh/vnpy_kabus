@@ -96,6 +96,16 @@ NK225_OP_RSS_SCOPE_PUT    = 20000     # 1限月 プット側（ATMから下）
 NK225_OP_RSS_SCOPE2_CALL  = 20000     # 2限月 コール側
 NK225_OP_RSS_SCOPE2_PUT   = 20000     # 2限月 プット側
 
+# 登録・解除の投げ直しの上限。失敗を無限に投げ直すと、情報系APIの流量
+# （10件/秒）を食い潰して他の銘柄照会まで止まる。
+MAX_REGISTER_RETRY: int = 3
+
+# 流量制限（429 / 4001006 API実行回数エラー）で弾かれたときの投げ直し。
+# これは「枠が埋まった」のではなく「投げすぎ」なので、待てば必ず通る。
+# 諦めて楽天RSSへ回す対象にはしない。
+MAX_RATE_LIMIT_RETRY: int = 10
+RATE_LIMIT_WAIT: float = 1.0
+
 # REST API地址
 REST_HOST: str = "http://localhost:18080"
 
@@ -350,6 +360,11 @@ class KabusRestApi(RestClient):
             f"{NK225_CODE}-{NK225_MONTH2}"
         ]
         self.queried_symbol_settings: list = []
+        # 登録・解除をやり直した回数。無限に投げ直さないための歯止め。
+        self.register_retry: dict = {}
+        self.unregister_retry: dict = {}
+        # 流量制限で弾かれた回数（上の2つとは別に数える）
+        self.rate_limit_retry: dict = {}
         self.thread_symbol: threading.Thread = None
         self.gateway.event_engine.register(EVENT_ATM, self.process_atm_event)
 
@@ -460,9 +475,14 @@ class KabusRestApi(RestClient):
         )
 
         # 生成 call option symbol strike_price in range [atm_price, atm_price + call_scope] with interval 500
+        # 窓の中は kabus が受け持つ。ATMが動いて外側から入ってきた行使価格は
+        # 楽天RSS側で既に引いてあるが、それを理由に飛ばしてはいけない（飛ばすと
+        # 窓の中なのに2秒更新のまま取り残され、kabus の枠も空いたままになる）。
+        # 両方に登録された状態は、RSS側のティックを捨てることで処理する。
         for strike_price in range(atm_price - 1000, atm_price + call_scope + 1, 1000):
             symbol_setting = f"{symbol_code}-{month}-C-{strike_price}"
-            if symbol_setting not in self.queried_symbol_settings and symbol_setting not in self.gateway.rest_rakuten_api.queried_symbol_settings:
+            if (symbol_setting not in self.queried_symbol_settings
+                    and symbol_setting not in self.symbol_settings):
                 self.symbol_settings.append(symbol_setting)
             # # strike_price with interval 500
             # strike_price += 500
@@ -473,7 +493,8 @@ class KabusRestApi(RestClient):
         # 生成 put option symbol strike_price in range [atm_price, atm_price - put_scope] with interval -500
         for strike_price in range(atm_price + 1000, atm_price - put_scope - 1, -1000):
             symbol_setting = f"{symbol_code}-{month}-P-{strike_price}"
-            if symbol_setting not in self.queried_symbol_settings and symbol_setting not in self.gateway.rest_rakuten_api.queried_symbol_settings:
+            if (symbol_setting not in self.queried_symbol_settings
+                    and symbol_setting not in self.symbol_settings):
                 self.symbol_settings.append(symbol_setting)
             # # strike_price with interval 500
             # strike_price -= 500
@@ -635,11 +656,24 @@ class KabusRestApi(RestClient):
         print("[__] unregister_all")
 
     def on_unregister_symbol(self, data: dict, request: Request) -> None:
-        """Tickデータ受信登録成功"""
-        print(f"on_unregister_symbol: count={len(data['RegistList'])}")
-        # for s in data["RegistList"]:
-        #     pprint.pprint(s)
+        """Tickデータ受信解除成功"""
         symbol = request.extra
+        msg = f"[OK] unregister: {symbol} (count={len(data['RegistList'])})"
+        print(msg)
+        self.gateway.write_log(msg)
+        self.drop_symbol(symbol)
+
+    def drop_symbol(self, symbol: str) -> None:
+        """kabus 側の持ち物からこの銘柄を落とす。
+
+        解除が成功したときと、「そもそも登録されていない」と返されたときの
+        両方で呼ぶ。ここをやらないと queried_symbol_settings に残り続け、
+        楽天RSSのティックが「kabusが持っている銘柄」として捨てられる。
+        """
+        self.unregister_retry.pop(symbol, None)
+        self.register_retry.pop(symbol, None)
+        self.rate_limit_retry.pop(symbol, None)
+
         # remove symbol from queried_symbol_settings
         symbol_setting = self.get_setting_from_symbol(symbol)
         if symbol_setting in self.queried_symbol_settings:
@@ -656,17 +690,39 @@ class KabusRestApi(RestClient):
         print(f"[OK] Fire event to Removing instrument from option master: {vt_symbol}")
         self.gateway.event_engine.put(event)
 
-        msg = f"[OK] unregister: {symbol} (count={len(data['RegistList'])})"
+    def on_unregister_failed(self, status_code: int, request: Request) -> None:
+        """Tickデータ受信解除失敗"""
+        symbol = request.extra
+        text: str = request.response.text if request.response is not None else ""
+        msg = f"[NG] unregister: {symbol}，状态码：{status_code}，信息：{text}"
         print(msg)
         self.gateway.write_log(msg)
 
-    def on_unregister_failed(self, status_code: int, request: Request) -> None:
-        """Tickデータ受信登録失敗"""
-        symbol = request.extra
-        msg = f"[NG] unregister: {symbol}，状态码：{status_code}，信息：{request.response.text}"
-        print(msg)
-        self.gateway.write_log(msg)
-        # retry register symbol
+        # 429 / 4001006 は流量制限。枠が埋まったわけではないので、
+        # 少し待って投げ直す（諦める対象にしない）。
+        if status_code == 429 or "4001006" in text:
+            count: int = self.rate_limit_retry.get(symbol, 0) + 1
+            self.rate_limit_retry[symbol] = count
+            if count <= MAX_RATE_LIMIT_RETRY:
+                time.sleep(RATE_LIMIT_WAIT)
+                self.unregister_symbol(symbol)
+                return
+            self.rate_limit_retry.pop(symbol, None)
+
+        # 4001020 = 「銘柄が解除できませんでした」＝そもそも登録されていない。
+        # 投げ直しても必ず同じなので、成功と同じ後始末をして打ち切る。
+        if "4001020" in text:
+            self.gateway.write_log(f"[OK] 未登録のため解除不要: {symbol}")
+            self.drop_symbol(symbol)
+            return
+
+        count: int = self.unregister_retry.get(symbol, 0) + 1
+        self.unregister_retry[symbol] = count
+        if count > MAX_REGISTER_RETRY:
+            self.unregister_retry.pop(symbol, None)
+            self.gateway.write_log(f"[NG] 解除を{MAX_REGISTER_RETRY}回で諦めます: {symbol}")
+            return
+
         time.sleep(0.2)
         self.unregister_symbol(symbol)
 
@@ -732,10 +788,11 @@ class KabusRestApi(RestClient):
     def run_query_symbol_thread(self) -> None:
         """Function run in the thread"""
         self.gateway.write_log("[__] Symbol取得スレッド起動")
-        # symbol_setting = self.symbol_settings.pop(0)
-        # self.query_symbol(symbol_setting)
+        # 1銘柄につき「銘柄コード照会・銘柄情報照会・受信登録」の3リクエスト
+        # が出る。0.2秒間隔だと 15件/秒 になり、情報系APIの 10件/秒 を超えて
+        # 429（API実行回数エラー）で弾かれる。0.35秒なら 約8.6件/秒。
         while self.active:
-            time.sleep(0.2)
+            time.sleep(0.35)
             if self.symbol_settings:
                 symbol_setting = self.symbol_settings.pop(0)
                 self.query_symbol(symbol_setting)
@@ -1241,6 +1298,8 @@ class KabusRestApi(RestClient):
         #     pprint.pprint(s)
 
         symbol = request.extra
+        self.rate_limit_retry.pop(symbol, None)
+        self.register_retry.pop(symbol, None)
         msg = f"[OK] register: {symbol} (count={len(data['RegistList'])})"
         print(msg)
         self.gateway.write_log(msg)
@@ -1248,10 +1307,33 @@ class KabusRestApi(RestClient):
     def on_register_failed(self, status_code: int, request: Request) -> None:
         """Tickデータ受信登録失敗"""
         symbol = request.extra
-        msg = f"[NG] register: {symbol}，状态码：{status_code}，信息：{request.response.text}"
+        text: str = request.response.text if request.response is not None else ""
+        msg = f"[NG] register: {symbol}，状态码：{status_code}，信息：{text}"
         print(msg)
         self.gateway.write_log(msg)
-        # retry register symbol
+
+        # 429 / 4001006 は流量制限。枠が埋まったわけではないので、
+        # 少し待って投げ直す（諦める対象にしない）。
+        if status_code == 429 or "4001006" in text:
+            count: int = self.rate_limit_retry.get(symbol, 0) + 1
+            self.rate_limit_retry[symbol] = count
+            if count <= MAX_RATE_LIMIT_RETRY:
+                time.sleep(RATE_LIMIT_WAIT)
+                self.register_symbol(symbol)
+                return
+            self.rate_limit_retry.pop(symbol, None)
+
+        count: int = self.register_retry.get(symbol, 0) + 1
+        self.register_retry[symbol] = count
+        if count > MAX_REGISTER_RETRY:
+            # 50銘柄の枠が埋まっているときはここに来る。諦めて楽天RSSへ回す。
+            self.register_retry.pop(symbol, None)
+            self.gateway.write_log(
+                f"[NG] 登録を{MAX_REGISTER_RETRY}回で諦め、楽天RSSへ回します: {symbol}"
+            )
+            self.handoff_to_rakuten(self.get_setting_from_symbol(symbol))
+            return
+
         time.sleep(0.2)
         self.register_symbol(symbol)
 
@@ -1644,6 +1726,8 @@ class RakutenRestApi(RestClient):
             f"{VIX_CODE}-{VIX_MONTH}"
         ]
         self.queried_symbol_settings: list = []
+        # 登録をやり直した回数。無限に投げ直さないための歯止め。
+        self.register_retry: dict = {}
         self.thread_symbol: threading.Thread = None
         # self.gateway.event_engine.register(EVENT_ATM, self.process_atm_event)
         self.gateway.event_engine.register(EVENT_VI, self.process_vi_event)
@@ -2079,10 +2163,21 @@ class RakutenRestApi(RestClient):
     def on_register_failed(self, status_code: int, request: Request) -> None:
         """Tickデータ受信登録失敗"""
         symbol = request.extra
-        msg = f"[NG] rakuten register: {symbol}，状态码：{status_code}，信息：{request.response.text}"
+        text: str = request.response.text if request.response is not None else ""
+        msg = f"[NG] rakuten register: {symbol}，状态码：{status_code}，信息：{text}"
         print(msg)
         self.gateway.write_log(msg)
-        # retry register symbol
+
+        # 無限に投げ直さない（Excelのアドインが落ちていると永久に失敗する）
+        count: int = self.register_retry.get(symbol, 0) + 1
+        self.register_retry[symbol] = count
+        if count > MAX_REGISTER_RETRY:
+            self.register_retry.pop(symbol, None)
+            self.gateway.write_log(
+                f"[NG] rakuten 登録を{MAX_REGISTER_RETRY}回で諦めます: {symbol}"
+            )
+            return
+
         time.sleep(0.2)
         self.register_symbol(symbol)
 
