@@ -365,11 +365,22 @@ class KabusRestApi(RestClient):
         self.unregister_retry: dict = {}
         # 流量制限で弾かれた回数（上の2つとは別に数える）
         self.rate_limit_retry: dict = {}
+        # 限月ごとに、いま楽天RSSへ渡している銘柄。ATMが動いたときに
+        # 新旧を比べて、増えたぶんを登録し、減ったぶんを解除する。
+        self.rss_option_settings: dict = {}
         self.thread_symbol: threading.Thread = None
         self.gateway.event_engine.register(EVENT_ATM, self.process_atm_event)
 
     def process_atm_event(self, event) -> None:
         """ATM价格变动事件处理"""
+        # 休場モードでは kabus のPUSHが来ないので、窓の銘柄を登録しても
+        # ティックは運ばれない。50枠と照会のAPI呼び出しを無駄に使うだけ
+        # なので、オプションの取得は楽天RSSに任せて何もしない。
+        # （このイベントは OptionMaster のチェーンが出すもので、休場中は
+        #  楽天RSS経由の原資産価格で発火する。）
+        if getattr(self.gateway, "market_closed_mode", False):
+            return
+
         atm: AtmData = event.data
         print(f"[OK] process_atm_event: {atm}")
         atm_price: int = atm.atm_strike
@@ -379,7 +390,12 @@ class KabusRestApi(RestClient):
         self.gateway.write_log(f"[OK] {chain_symbol} ATM価格: {atm_price}")
         if (chain_symbol == SYMBOL_NK225_MONTH) and (self.atm_price != atm_price):
             self.gateway.write_log(f"[OK] {chain_symbol} ATM価格変更: {self.atm_price} -> {atm_price}")
-            if atm_price > self.atm_price:
+            # 初回（self.atm_price が 0）はまだ何も登録していない。0 を基準に
+            # 端の行使価格を計算すると nk-2611-C--1000 のような存在しない銘柄に
+            # なるので、解除は飛ばして生成だけ行う。
+            if not self.atm_price:
+                pass
+            elif atm_price > self.atm_price:
                 # ATM価格上昇の場合、一番小さいのCallとPutオプション銘柄をクリア
                 c_strike_price = self.atm_price - 1000
                 symbol_setting = f"{NK225_OP_CODE}-{NK225_OP_MONTH}-C-{c_strike_price}" # ex. NK225op-2603-C-52000 (ATM: 53000)
@@ -390,14 +406,12 @@ class KabusRestApi(RestClient):
                 symbol_setting = f"{NK225_OP_CODE}-{NK225_OP_MONTH}-P-{p_strike_price}" # ex. NK225op-2603-P-41000
                 symbol = self.get_symbol_from_setting(symbol_setting) # ex. nk-2603-P-41000
                 self.unregister_symbol(symbol)
-                self.handoff_to_rakuten(symbol_setting)
             else:
                 # ATM価格下降の場合、一番大きいのCallとPutオプション銘柄をクリア
                 c_strike_price = self.atm_price + NK225_OP_STRIKE_SCOPE_CALL
                 symbol_setting = f"{NK225_OP_CODE}-{NK225_OP_MONTH}-C-{c_strike_price}" # ex. NK225op-2603-C-65000
                 symbol = self.get_symbol_from_setting(symbol_setting) # ex. nk-2603-C-65000
                 self.unregister_symbol(symbol)
-                self.handoff_to_rakuten(symbol_setting)
 
                 p_strike_price = self.atm_price + 1000
                 symbol_setting = f"{NK225_OP_CODE}-{NK225_OP_MONTH}-P-{p_strike_price}" # ex. NK225op-2603-P-54000 (ATM: 53000)
@@ -415,7 +429,9 @@ class KabusRestApi(RestClient):
             )
         elif (chain_symbol == SYMBOL_NK225_MONTH2) and (self.atm_price2 != atm_price):
             self.gateway.write_log(f"[OK] {chain_symbol} ATM価格変更: {self.atm_price2} -> {atm_price}")
-            if atm_price > self.atm_price2:
+            if not self.atm_price2:
+                pass                    # 初回。上と同じ理由で解除は飛ばす。
+            elif atm_price > self.atm_price2:
                 # ATM価格上昇の場合、一番小さいのCallとPutオプション銘柄をクリア
                 c_strike_price = self.atm_price2 - 1000
                 symbol_setting = f"{NK225_OP_CODE}-{NK225_OP_MONTH2}-C-{c_strike_price}" # ex. NK225op-2603-C-52000 (ATM: 53000)
@@ -426,14 +442,12 @@ class KabusRestApi(RestClient):
                 symbol_setting = f"{NK225_OP_CODE}-{NK225_OP_MONTH2}-P-{p_strike_price}" # ex. NK225op-2603-P-41000
                 symbol = self.get_symbol_from_setting(symbol_setting) # ex. nk-2603-P-41000
                 self.unregister_symbol(symbol)
-                self.handoff_to_rakuten(symbol_setting)
             else:
                 # ATM価格下降の場合、一番大きいのCallとPutオプション銘柄をクリア
                 c_strike_price = self.atm_price2 + NK225_OP_STRIKE_SCOPE2_CALL
                 symbol_setting = f"{NK225_OP_CODE}-{NK225_OP_MONTH2}-C-{c_strike_price}" # ex. NK225op-2603-C-65000
                 symbol = self.get_symbol_from_setting(symbol_setting) # ex. nk-2603-C-65000
                 self.unregister_symbol(symbol)
-                self.handoff_to_rakuten(symbol_setting)
 
                 p_strike_price = self.atm_price2 + 1000
                 symbol_setting = f"{NK225_OP_CODE}-{NK225_OP_MONTH2}-P-{p_strike_price}" # ex. NK225op-2603-P-54000 (ATM: 53000)
@@ -467,13 +481,6 @@ class KabusRestApi(RestClient):
         if put_scope is None:
             put_scope = call_scope
 
-        # kabus の窓の外側を楽天RSSへ。内側と重ならないよう、kabus の端の
-        # 1つ外から始める。
-        self._add_rss_option_settings(
-            symbol_code, month, atm_price,
-            call_scope, put_scope, rss_call_scope, rss_put_scope,
-        )
-
         # 生成 call option symbol strike_price in range [atm_price, atm_price + call_scope] with interval 500
         # 窓の中は kabus が受け持つ。ATMが動いて外側から入ってきた行使価格は
         # 楽天RSS側で既に引いてあるが、それを理由に飛ばしてはいけない（飛ばすと
@@ -502,6 +509,13 @@ class KabusRestApi(RestClient):
             # if symbol_setting not in self.queried_symbol_settings and symbol_setting not in self.gateway.rest_rakuten_api.queried_symbol_settings:
             #     self.gateway.rest_rakuten_api.symbol_settings.append(symbol_setting)
 
+        # kabus の窓を決めたあとで、その外側を楽天RSSへ回す。順番が逆だと、
+        # 窓に入ってきた銘柄を「どこの担当でもない」と誤判定して契約ごと
+        # 消してしまう。
+        self._add_rss_option_settings(
+            symbol_code, month, atm_price,
+            call_scope, put_scope, rss_call_scope, rss_put_scope,
+        )
 
     def _add_rss_option_settings(
         self, symbol_code: str, month: int, atm_price: int,
@@ -519,20 +533,33 @@ class KabusRestApi(RestClient):
         if rakuten is None or not getattr(self.gateway, "rakuten_rss", False):
             return
 
-        outer: list[str] = []
+        outer: set = set()
         if rss_call_scope > call_scope:
             for strike_price in range(
                 atm_price + call_scope + 1000, atm_price + rss_call_scope + 1, 1000
             ):
-                outer.append(f"{symbol_code}-{month}-C-{strike_price}")
+                outer.add(f"{symbol_code}-{month}-C-{strike_price}")
         if rss_put_scope > put_scope:
             for strike_price in range(
                 atm_price - put_scope - 1000, atm_price - rss_put_scope - 1, -1000
             ):
-                outer.append(f"{symbol_code}-{month}-P-{strike_price}")
+                outer.add(f"{symbol_code}-{month}-P-{strike_price}")
 
-        for symbol_setting in outer:
+        previous: set = self.rss_option_settings.get(month, set())
+        self.rss_option_settings[month] = outer
+
+        for symbol_setting in sorted(outer - previous):
             rakuten.ensure_symbol(symbol_setting)
+
+        # 外れた銘柄は受信を止める。kabus の窓に入ったものは kabus が契約を
+        # 持ち続けるので、OptionMaster からは外さない。どちらの担当でも
+        # なくなったものだけ、契約ごと片づける。
+        for symbol_setting in sorted(previous - outer):
+            taken_by_kabus: bool = (
+                symbol_setting in self.queried_symbol_settings
+                or symbol_setting in self.symbol_settings
+            )
+            rakuten.release_symbol(symbol_setting, not taken_by_kabus)
 
     def sign(self, request: Request) -> Request:
         """生成FTX签名"""
@@ -603,8 +630,22 @@ class KabusRestApi(RestClient):
             self.gateway.write_log("[NG] トークン取得")
 
     def serves_symbol(self, symbol: str) -> bool:
-        """この銘柄を kabus 側で受けているか（楽天RSSの重複を捨てるため）。"""
+        """この銘柄を kabus 側で受けているか（楽天RSSの重複を捨てるため）。
+
+        休場モードでは kabus のPUSHが来ないので、登録してあっても「受けて
+        いる」ことにはならない。True を返すと、唯一の供給元である楽天RSSの
+        ティックまで捨ててしまう。休場モードでは process_atm_event が抜ける
+        ので普通は登録が残らないが、モードを切り替えた直後の取りこぼしを
+        防ぐため、ここでも見ておく。
+        """
+        if getattr(self.gateway, "market_closed_mode", False):
+            return False
         return self.get_setting_from_symbol(symbol) in self.queried_symbol_settings
+
+    def on_error(self, exc, value, tb, request=None) -> None:
+        """リクエストで例外。UIのログにも出す（基底は print だけ）。"""
+        self.gateway.write_log(f"[NG] kabus REST 例外: {exc.__name__}: {value}")
+        super().on_error(exc, value, tb, request)
 
     def handoff_to_rakuten(self, symbol_setting: str) -> None:
         """kabus の窓から外れた銘柄を、楽天RSS側に引き継ぐ。
@@ -1748,8 +1789,8 @@ class RakutenRestApi(RestClient):
                 NK225_OP_CODE,
                 NK225_OP_MONTH,
                 atm_price,
-                NK225_OP_STRIKE_SCOPE_CALL,
-                NK225_OP_STRIKE_SCOPE_PUT
+                NK225_OP_RSS_SCOPE_CALL,
+                NK225_OP_RSS_SCOPE_PUT
             )
         elif (chain_symbol == SYMBOL_NK225_MONTH2) and (self.atm_price2 != atm_price):
             self.gateway.write_log(f"[OK] rakuten {chain_symbol} ATM価格変更: {self.atm_price2} -> {atm_price}")
@@ -1758,8 +1799,8 @@ class RakutenRestApi(RestClient):
                 NK225_OP_CODE,
                 NK225_OP_MONTH2,
                 atm_price,
-                NK225_OP_STRIKE_SCOPE2_CALL,
-                NK225_OP_STRIKE_SCOPE2_PUT
+                NK225_OP_RSS_SCOPE2_CALL,
+                NK225_OP_RSS_SCOPE2_PUT
             )
 
     def process_vi_event(self, event) -> None:
@@ -1773,11 +1814,16 @@ class RakutenRestApi(RestClient):
         self, symbol_code: str, month: int, atm_price: int,
         call_scope: int, put_scope: int | None = None
     ) -> None:
-        """生成option symbol settings
+        """生成option symbol settings（楽天RSS側）
+
+        こちらは休場モードで呼ばれる。板が無い時間帯は kabus のPUSHが来ない
+        ので、楽天RSSがオプションを全部受け持つ。したがって幅は kabus の窓
+        （NK225_OP_STRIKE_SCOPE_*）ではなく、受け持ちの全体である
+        NK225_OP_RSS_SCOPE_* を渡すこと。
 
         call_scope … ATMより上をいくつまで取るか（コール）
         put_scope  … ATMより下をいくつまで取るか（プット）。省略したら
-                     コールと同じ幅（これまでの動き）。
+                     コールと同じ幅。
         """
         if put_scope is None:
             put_scope = call_scope
@@ -2122,6 +2168,83 @@ class RakutenRestApi(RestClient):
 
         self.symbol_settings.append(symbol_setting)
 
+    def on_error(self, exc, value, tb, request=None) -> None:
+        """リクエストで例外。UIのログにも出す（基底は print だけ）。"""
+        if issubclass(exc, ConnectionError) or "ConnectionError" in exc.__name__:
+            self.warn_rss_down(f"REST {RAKUTEN_RSS_REST_HOST}")
+            return
+        self.gateway.write_log(f"[NG] rakuten REST 例外: {exc.__name__}: {value}")
+        super().on_error(exc, value, tb, request)
+
+    def warn_rss_down(self, where: str) -> None:
+        """RSSに繋がらないことを一度だけ知らせる。"""
+        if getattr(self.gateway, "_rss_down_logged", None) == where:
+            return
+        self.gateway._rss_down_logged = where
+        self.gateway.write_log(
+            f"[NG] 楽天RSSに接続できません（{where}）。"
+            "Excel と vnpy_rakuten_rss_option.xlsm を開いてアドインを"
+            "起動してください。使わない場合は接続設定の rakuten_rss を"
+            "False にしてください。"
+        )
+
+    def release_symbol(self, symbol_setting: str, drop_contract: bool) -> None:
+        """この銘柄を楽天RSSの受信から外す。
+
+        drop_contract が True なら、kabus 側も持っていない＝もうどこからも
+        来ない銘柄なので、契約と OptionMaster の建玉行も片づける。
+        """
+        symbol: str = self.get_symbol_from_setting(symbol_setting)
+        if symbol_setting in self.queried_symbol_settings:
+            self.queried_symbol_settings.remove(symbol_setting)
+        if symbol_setting in self.symbol_settings:
+            self.symbol_settings.remove(symbol_setting)
+        self.register_retry.pop(symbol, None)
+
+        self.unregister_symbol(symbol)
+
+        if not drop_contract:
+            return
+        if symbol in symbol_contract_map:
+            del symbol_contract_map[symbol]
+        event = Event(EVENT_OPTION_INSTRUMENT_REMOVE, f"{symbol}.JPX")
+        self.gateway.event_engine.put(event)
+
+    def unregister_symbol(self, symbol: str):
+        """Tickデータ受信解除"""
+        symbol_ksb = SYMBOL_VT2KBS.get(symbol, None)
+        if symbol_ksb is None:
+            self.gateway.write_log(f"[NG] rakuten Tickデータ受信解除 銘柄コード変換：{symbol}")
+            return
+
+        market = '2'
+        data = {'Symbols': [{'Symbol': symbol_ksb, 'Exchange': market}]}
+
+        self.add_request(
+            method="PUT",
+            path="/rakutenapi/unregister",
+            callback=self.on_unregister_symbol,
+            data=data,
+            on_failed=self.on_unregister_failed,
+            extra=symbol
+        )
+        print(f"[__] rakuten unregister_symbol: {symbol}")
+        self.gateway.write_log("[__] rakuten unregister: " + symbol)
+
+    def on_unregister_symbol(self, data: dict, request: Request) -> None:
+        """Tickデータ受信解除成功"""
+        msg = (f"[OK] rakuten unregister: {request.extra} "
+               f"(count={len(data.get('RegistList', []))})")
+        print(msg)
+        self.gateway.write_log(msg)
+
+    def on_unregister_failed(self, status_code: int, request: Request) -> None:
+        """Tickデータ受信解除失敗。投げ直さない（登録が無いだけのことが多い）。"""
+        text: str = request.response.text if request.response is not None else ""
+        msg = f"[NG] rakuten unregister: {request.extra}，状态码：{status_code}，信息：{text}"
+        print(msg)
+        self.gateway.write_log(msg)
+
     def register_symbol(self, symbol: str):
         """Tickデータ受信登録"""
         symbol_ksb = SYMBOL_VT2KBS.get(symbol, None)
@@ -2227,9 +2350,20 @@ class RakutenWebsocketApi(WebsocketClient):
         # self.thread = threading.Thread(target=self.run_tickdata_thread)
         # self.thread.start()
 
+    def on_error(self, e: Exception) -> None:
+        """Websocketで例外。UIのログにも出す（基底は print だけ）。"""
+        if isinstance(e, (ConnectionRefusedError, OSError)):
+            self.gateway.rest_rakuten_api.warn_rss_down(
+                f"Websocket {RAKUTEN_RSS_WEBSOCKET_HOST}"
+            )
+            return
+        self.gateway.write_log(f"[NG] rakuten Websocket 例外: {e}")
+        super().on_error(e)
+
     def on_connected(self) -> None:
         """连接成功回报"""
         self.gateway.write_log("[OK] rakuten 時価Websocket 接続")
+        self.gateway._rss_down_logged = None     # 繋がったので次回また出す
 
         # self.ping()
 
@@ -2374,8 +2508,8 @@ class RakutenWebsocketApi(WebsocketClient):
                     NK225_OP_CODE,
                     NK225_OP_MONTH,
                     atm_price,
-                    NK225_OP_STRIKE_SCOPE_CALL,
-                    NK225_OP_STRIKE_SCOPE_PUT
+                    NK225_OP_RSS_SCOPE_CALL,
+                    NK225_OP_RSS_SCOPE_PUT
                 )
 
         if symbol == SYMBOL_NK225_MONTH2 and not self.gateway.rest_rakuten_api.atm_price2:
@@ -2387,8 +2521,8 @@ class RakutenWebsocketApi(WebsocketClient):
                     NK225_OP_CODE,
                     NK225_OP_MONTH2,
                     atm_price,
-                    NK225_OP_STRIKE_SCOPE2_CALL,
-                    NK225_OP_STRIKE_SCOPE2_PUT
+                    NK225_OP_RSS_SCOPE2_CALL,
+                    NK225_OP_RSS_SCOPE2_PUT
                 )
 
         # 过滤还没有收到合约数据前的行情推送
