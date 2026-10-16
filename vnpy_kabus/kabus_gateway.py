@@ -100,6 +100,10 @@ NK225_OP_RSS_SCOPE2_PUT   = 20000     # 2限月 プット側
 # （10件/秒）を食い潰して他の銘柄照会まで止まる。
 MAX_REGISTER_RETRY: int = 3
 
+# 建玉残高を楽天RSSから引き直す間隔（秒）。JPXが引け後に1日1回出す値なので、
+# 細かく引く意味は無い。起動直後に1回、あとはこの間隔で十分。
+OPEN_INTEREST_INTERVAL: int = 300
+
 # 流量制限（429 / 4001006 API実行回数エラー）で弾かれたときの投げ直し。
 # これは「枠が埋まった」のではなく「投げすぎ」なので、待てば必ず通る。
 # 諦めて楽天RSSへ回す対象にはしない。
@@ -228,6 +232,9 @@ class KabusGateway(BaseGateway):
         self.orderid_kbs_orderid_map: Dict[str, str] = {}
         self.kbs_orderid_orderid_map: Dict[str, str] = {}
         self.trade_ids: Set = set()
+        # 銘柄 → 建玉残高。楽天RSSから定期的に引いて、kabus 側のティックにも
+        # 載せる（kabus のPUSHには建玉が無い）。
+        self.open_interest: Dict[str, float] = {}
         self.order_query_time = (datetime.now(JAPAN_TZ) + timedelta(minutes=-1)).strftime("%Y%m%d%H%M%S")
         # self.order_query_time = None
 
@@ -1608,6 +1615,8 @@ class KabusWebsocketApi(WebsocketClient):
             last_volume=volume,
             # last_price は上の板加重midなので、約定値そのものは別に持つ
             trade_price=packet.get("CurrentPrice") or 0,
+            # kabus のPUSHに建玉残高は無い。楽天RSSから引いた表を載せる。
+            open_interest=self.gateway.open_interest.get(symbol, 0),
 
             ask_price_1=packet.get("Sell1", {}).get("Price"),
             ask_volume_1=packet.get("Sell1", {}).get("Qty"),
@@ -1731,6 +1740,24 @@ class KabusWebsocketApi(WebsocketClient):
         self.thread = None
 
 
+def rss_name_to_symbol(name: str) -> str | None:
+    """楽天RSSアドインの銘柄名キーを vn.py の銘柄に直す。
+
+        26-11-C-68000 -> nk-2611-C-68000
+        26-11-F-0     -> nk-2611
+        vi-n1-V-0     -> None（指数はここでは扱わない）
+    """
+    parts: list = name.split("-")
+    if len(parts) != 4:
+        return None
+    year, month, put_or_call, strike = parts
+    if put_or_call in ("C", "P"):
+        return f"nk-{year}{month}-{put_or_call}-{strike}"
+    if put_or_call == "F":
+        return f"nk-{year}{month}"
+    return None
+
+
 class RakutenRestApi(RestClient):
     """Rakuten的REST API"""
 
@@ -1755,6 +1782,8 @@ class RakutenRestApi(RestClient):
         self.active: bool = False
         self.thread_order: threading.Thread = None
         self.lock: threading.Lock = threading.Lock()
+
+        self.thread_open_interest: threading.Thread = None
 
         self.trading_future_symbol: str = "nk-YYMM"
         self.atm_price: int = 0
@@ -1915,6 +1944,10 @@ class RakutenRestApi(RestClient):
             self.active: bool = True
             self.thread_symbol = threading.Thread(target=self.run_query_symbol_thread)
             self.thread_symbol.start()
+            self.thread_open_interest = threading.Thread(
+                target=self.run_query_open_interest_thread
+            )
+            self.thread_open_interest.start()
         else:
             self.gateway.write_log("[NG] rakuten トークン取得")
 
@@ -1948,6 +1981,59 @@ class RakutenRestApi(RestClient):
         msg = f"[NG] rakuten 全銘柄登録解除，状态码：{status_code}，信息：{request.response.text}"
         print(msg)
         self.gateway.write_log(msg)
+
+    def query_open_interest(self) -> None:
+        """設定シートの全銘柄の建玉残高を一括で取る。
+
+        アドインは登録銘柄しかWebsocketに流さないので、kabus が受け持って
+        いる内側の行使価格は配信に乗らない。建玉は1日1回しか変わらないため、
+        シート全体をRESTで読むほうが安く、取りこぼしも無い。
+        """
+        self.add_request(
+            method="GET",
+            path="/rakutenapi/openinterest",
+            callback=self.on_query_open_interest,
+            on_failed=self.on_query_open_interest_failed,
+        )
+
+    def on_query_open_interest(self, data: dict, request: Request) -> None:
+        """建玉残高取得成功。銘柄名キーを vn.py の銘柄に直して覚える。"""
+        updated: int = 0
+        for name, value in (data or {}).items():
+            symbol: str | None = rss_name_to_symbol(name)
+            if symbol is None:
+                continue
+            try:
+                open_interest: float = float(str(value).replace(",", ""))
+            except (TypeError, ValueError):
+                continue
+            self.gateway.open_interest[symbol] = open_interest
+            updated += 1
+        self.gateway.write_log(f"[OK] rakuten 建玉残高 {updated}銘柄")
+
+    def on_query_open_interest_failed(self, status_code: int, request: Request) -> None:
+        """建玉残高取得失敗。1回だけ知らせる（アドインが古いと404になる）。"""
+        if getattr(self.gateway, "_oi_failed_logged", False):
+            return
+        self.gateway._oi_failed_logged = True
+        text: str = request.response.text if request.response is not None else ""
+        self.gateway.write_log(
+            f"[NG] rakuten 建玉残高の取得に失敗（{status_code}）: {text[:120]} / "
+            "アドインに /rakutenapi/openinterest が無い場合は、"
+            "RakutenRssVnpyAddIn を再ビルドしてください。"
+        )
+
+    def run_query_open_interest_thread(self) -> None:
+        """建玉残高を定期的に引き直すスレッド。"""
+        self.gateway.write_log("[__] rakuten 建玉残高取得スレッド起動")
+        waited: float = OPEN_INTEREST_INTERVAL
+        while self.active:
+            if waited >= OPEN_INTEREST_INTERVAL:
+                waited = 0.0
+                self.query_open_interest()
+            time.sleep(1.0)
+            waited += 1.0
+        self.gateway.write_log("[OK] rakuten 建玉残高取得スレッド終了")
 
     def query_symbol(self, symbol_setting: str) -> None:
     # def query_symbol(self, code: str, month: int, op_weekly: int=None, op_type: str=None, op_strike_price: int=None) -> None:
@@ -2427,6 +2513,17 @@ class RakutenWebsocketApi(WebsocketClient):
             self.gateway.write_log(f"[NG] rakuten 推送数据 銘柄コード変換：{symbol_kbs}")
             return
 
+        # 建玉残高は kabus のPUSHに無いので、捨てる前に取り出して覚える。
+        # 配信に入っていない（アドインが古い）ときは何もしない。
+        open_interest_text = packet.get("OpenInterest")
+        if open_interest_text not in (None, ""):
+            try:
+                self.gateway.open_interest[symbol] = float(
+                    str(open_interest_text).replace(",", "")
+                )
+            except ValueError:
+                pass
+
         # kabus に登録されている銘柄は、そちらの速いPUSHで受けている。RSSは
         # 2秒おきなので、同じ銘柄を両方から入れると遅い値で上書きしてしまう。
         if self.gateway.rest_api.serves_symbol(symbol):
@@ -2489,6 +2586,7 @@ class RakutenWebsocketApi(WebsocketClient):
             pre_close=float(packet.get("PreviousClose")),
             last_price=last_price,
             last_volume=volume,
+            open_interest=self.gateway.open_interest.get(symbol, 0),
 
             ask_price_1=ask_price_1,
             ask_volume_1=ask_volume_1,
