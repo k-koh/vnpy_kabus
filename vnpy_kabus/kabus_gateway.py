@@ -2,6 +2,7 @@ import json
 import pprint
 import threading
 import time
+import traceback
 from copy import copy
 from enum import Enum
 from functools import lru_cache
@@ -313,13 +314,23 @@ class KabusGateway(BaseGateway):
         # self.ws_api.join_tickdata_thread()
 
     def process_timer_event(self, event) -> None:
-        """定时事件处理"""
-        self.count += 1
-        if self.count < 15:
-            return
-        self.count = 0
-        self.ws_api.ping()
-        # self.ws_rakuten_api.ping()
+        """定时事件处理
+
+        ここはイベントエンジンのスレッドで動く。vn.py の EventEngine は
+        ハンドラの例外を捕まえないので、ここから例外を出すとスレッドごと
+        死に、ティックもタイマーも止まる。何があっても外には出さない。
+        """
+        try:
+            self.count += 1
+            if self.count < 15:
+                return
+            self.count = 0
+            self.ws_api.ping()
+            # self.ws_rakuten_api.ping()
+        except Exception:
+            self.write_log(
+                "[NG] タイマー処理で例外: " + traceback.format_exc(limit=3)
+            )
 
     def init_ping(self) -> None:
         """初始化心跳"""
@@ -1464,6 +1475,8 @@ class KabusWebsocketApi(WebsocketClient):
 
         self.start_time = datetime.utcnow().date()
         self.count = 0
+        # heartbeat を送れなかったことを知らせ済みか（繋がり直したら戻す）
+        self.ping_failed: bool = False
 
         # Database历史Tick数据模拟实盘行情
         self.history_data: list = []
@@ -1491,6 +1504,7 @@ class KabusWebsocketApi(WebsocketClient):
     def on_connected(self) -> None:
         """连接成功回报"""
         self.gateway.write_log("[OK] 時価Websocket 接続")
+        self.ping_failed = False
 
         self.ping()
 
@@ -1498,9 +1512,15 @@ class KabusWebsocketApi(WebsocketClient):
             self.resubscribe(req)
 
 
-    def on_disconnected(self) -> None:
-        """"""
-        self.gateway.write_log("[OK] 時価Websocket 切断")
+    def on_disconnected(self, status_code: int = 0, msg: str = "") -> None:
+        """切断回报。
+
+        基底は on_disconnected(status_code, msg) で呼ぶ。引数なしで定義して
+        いたため TypeError になり、切断のログが一度も出ていなかった。
+        """
+        self.gateway.write_log(
+            f"[OK] 時価Websocket 切断 (code={status_code} {msg})"
+        )
 
 
     def subscribe(self, req: SubscribeRequest) -> None:
@@ -1534,8 +1554,36 @@ class KabusWebsocketApi(WebsocketClient):
 
 
     def ping(self) -> None:
-        """发送心跳"""
-        self.send_packet({'op': 'ping'})
+        """发送心跳
+
+        切断された直後は wsapp が残ったままソケットだけ死んでいることが
+        あり、そこへ送ると ConnectionResetError が飛ぶ。これはタイマー
+        イベントの中で起きるので、素通しするとイベントエンジンごと落ちる。
+
+        再接続は WebsocketClient が run_forever(reconnect=1) で自前で
+        やるので、ここでは送れないことを一度知らせて見送るだけでよい。
+        """
+        wsapp = self.wsapp
+        if wsapp is None or getattr(wsapp, "sock", None) is None:
+            self._warn_ping("まだ繋がっていません")
+            return
+
+        try:
+            self.send_packet({'op': 'ping'})
+        except Exception as exc:
+            self._warn_ping(f"{type(exc).__name__}: {exc}")
+            return
+
+        self.ping_failed = False
+
+    def _warn_ping(self, reason: str) -> None:
+        """pingを送れないことを一度だけ知らせる（毎回出すとログが埋まる）。"""
+        if self.ping_failed:
+            return
+        self.ping_failed = True
+        self.gateway.write_log(
+            f"[NG] 時価Websocket heartbeat 見送り（{reason}）。再接続を待ちます。"
+        )
 
 
     def on_packet(self, packet: Any) -> None:
@@ -2412,6 +2460,8 @@ class RakutenWebsocketApi(WebsocketClient):
 
         self.start_time = datetime.utcnow().date()
         self.count = 0
+        # heartbeat を送れなかったことを知らせ済みか（繋がり直したら戻す）
+        self.ping_failed: bool = False
 
         # Database历史Tick数据模拟实盘行情
         self.history_data: list = []
@@ -2450,6 +2500,7 @@ class RakutenWebsocketApi(WebsocketClient):
         """连接成功回报"""
         self.gateway.write_log("[OK] rakuten 時価Websocket 接続")
         self.gateway._rss_down_logged = None     # 繋がったので次回また出す
+        self.ping_failed = False
 
         # self.ping()
 
@@ -2457,9 +2508,11 @@ class RakutenWebsocketApi(WebsocketClient):
             self.resubscribe(req)
 
 
-    def on_disconnected(self) -> None:
-        """"""
-        self.gateway.write_log("[OK] rakuten 時価Websocket 切断")
+    def on_disconnected(self, status_code: int = 0, msg: str = "") -> None:
+        """切断回报（引数は基底に合わせる）。"""
+        self.gateway.write_log(
+            f"[OK] rakuten 時価Websocket 切断 (code={status_code} {msg})"
+        )
 
 
     def subscribe(self, req: SubscribeRequest) -> None:
@@ -2493,8 +2546,36 @@ class RakutenWebsocketApi(WebsocketClient):
 
 
     def ping(self) -> None:
-        """发送心跳"""
-        self.send_packet({'op': 'ping'})
+        """发送心跳
+
+        切断された直後は wsapp が残ったままソケットだけ死んでいることが
+        あり、そこへ送ると ConnectionResetError が飛ぶ。これはタイマー
+        イベントの中で起きるので、素通しするとイベントエンジンごと落ちる。
+
+        再接続は WebsocketClient が run_forever(reconnect=1) で自前で
+        やるので、ここでは送れないことを一度知らせて見送るだけでよい。
+        """
+        wsapp = self.wsapp
+        if wsapp is None or getattr(wsapp, "sock", None) is None:
+            self._warn_ping("まだ繋がっていません")
+            return
+
+        try:
+            self.send_packet({'op': 'ping'})
+        except Exception as exc:
+            self._warn_ping(f"{type(exc).__name__}: {exc}")
+            return
+
+        self.ping_failed = False
+
+    def _warn_ping(self, reason: str) -> None:
+        """pingを送れないことを一度だけ知らせる（毎回出すとログが埋まる）。"""
+        if self.ping_failed:
+            return
+        self.ping_failed = True
+        self.gateway.write_log(
+            f"[NG] rakuten 時価Websocket heartbeat 見送り（{reason}）。再接続を待ちます。"
+        )
 
 
     def on_packet(self, packet: Any) -> None:
