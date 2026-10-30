@@ -211,6 +211,9 @@ class KabusGateway(BaseGateway):
     default_setting: Dict[str, Any] = {
         "API Key": "",
         "market_closed_mode": ["False", "True"],
+        # kabus のAPIが使えないとき（利用期限切れ・停止中など）に True。
+        # kabus には一切つながず、先物もオプションも楽天RSSから取る。
+        "disable_kabus": ["False", "True"],
         # kabus の時価PUSHは登録50銘柄まで。そこに入らない外側の行使価格を
         # 楽天RSS（Excelアドイン）から受けるかどうか。Excel と
         # マーケットスピードII を立ち上げていないときは False にする。
@@ -244,6 +247,16 @@ class KabusGateway(BaseGateway):
         key: str = setting["API Key"]
         self.market_closed_mode: bool = setting.get("market_closed_mode", "False") == "True"
         self.rakuten_rss: bool = setting.get("rakuten_rss", "True") == "True"
+        self.disable_kabus: bool = setting.get("disable_kabus", "False") == "True"
+
+        if self.disable_kabus:
+            # kabus を使わないなら、供給元は楽天RSSしか無い。設定で False に
+            # なっていても、ここで入れておかないと何も流れてこない。
+            self.rakuten_rss = True
+            self.write_log(
+                "[__] kabus 無効モード: 先物・オプションは楽天RSSのみから取ります"
+                "（発注・口座照会はできません）"
+            )
 
         # 楽天RSSは、kabus の50銘柄に入らない外側の行使価格を受け持つ。
         # 休場モードでは先物もこちらから取るので、そのときも繋ぐ。
@@ -253,37 +266,63 @@ class KabusGateway(BaseGateway):
         else:
             self.write_log("[__] 楽天RSSは使いません（kabusの50銘柄のみ）")
 
-        self.rest_api.connect(key)
-        self.ws_api.connect(key)
+        if not self.disable_kabus:
+            self.rest_api.connect(key)
+            self.ws_api.connect(key)
+            self.init_ping()
 
-        self.init_ping()
+    def kabus_unavailable(self, what: str) -> bool:
+        """kabus 無効のときに、kabus にしかできない操作を断る。
+
+        つながっていないRESTへ投げると例外になるので、手前で止めて理由を
+        ログに出す。True を返したら呼び出し側は何もしない。
+        """
+        if not getattr(self, "disable_kabus", False):
+            return False
+        self.write_log(f"[NG] kabus 無効のため{what}はできません（楽天RSSは閲覧のみ）")
+        return True
 
     def subscribe(self, req: SubscribeRequest) -> None:
         """订阅行情"""
+        if getattr(self, "disable_kabus", False):
+            # 銘柄の登録は楽天RSS側が自分で持っているので、ここは何もしない。
+            return
         self.ws_api.subscribe(req)
 
     def unsubscribe(self, req: SubscribeRequest) -> None:
         """取消行情订阅"""
+        if getattr(self, "disable_kabus", False):
+            return
         self.ws_api.unsubscribe(req)
 
     def send_order(self, req: OrderRequest) -> None:
         """委托下单"""
+        if self.kabus_unavailable("発注"):
+            return ""
         return self.rest_api.send_order(req)
 
     def cancel_order(self, req: CancelRequest) -> None:
         """委托撤单"""
+        if self.kabus_unavailable("取消"):
+            return
         self.rest_api.cancel_order(req)
 
     def query_account(self) -> None:
         """查询资金"""
+        if self.kabus_unavailable("口座照会"):
+            return
         self.rest_api.query_account()
 
     def query_position(self) -> None:
         """查询持仓"""
+        if self.kabus_unavailable("建玉照会"):
+            return
         self.rest_api.query_position()
 
     def query_orders(self) -> None:
         """查询未成交委托"""
+        if self.kabus_unavailable("注文照会"):
+            return
         self.rest_api.query_order()
 
     def on_order(self, order: OrderData) -> None:
@@ -301,17 +340,34 @@ class KabusGateway(BaseGateway):
 
     def close(self) -> None:
         """关闭连接"""
-        self.rest_api.stop()
-        self.ws_api.stop()
         self.rest_rakuten_api.stop()
         self.ws_rakuten_api.stop()
         self.rest_rakuten_api.stop_query_order()
         self.rest_rakuten_api.join_query_order()
+
+        # kabus 無効のときは繋いでいないので、止めるものも無い。
+        if getattr(self, "disable_kabus", False):
+            return
+        self.rest_api.stop()
+        self.ws_api.stop()
         self.rest_api.stop_query_order()
         self.rest_api.join_query_order()
 
         # self.ws_api.stop_tickdata_thread()
         # self.ws_api.join_tickdata_thread()
+
+    def rss_only(self) -> bool:
+        """楽天RSSだけで動いているか。
+
+        ・disable_kabus      … kabus のAPIを使わない設定
+        ・market_closed_mode … 板が無く kabus のPUSHが来ない時間帯
+        どちらも「先物もオプションも楽天RSSから取る」という意味では同じ
+        なので、受け持ちの判断はこれ1つで見る。
+        """
+        return bool(
+            getattr(self, "disable_kabus", False)
+            or getattr(self, "market_closed_mode", False)
+        )
 
     def process_timer_event(self, event) -> None:
         """定时事件处理
@@ -391,12 +447,12 @@ class KabusRestApi(RestClient):
 
     def process_atm_event(self, event) -> None:
         """ATM价格变动事件处理"""
-        # 休場モードでは kabus のPUSHが来ないので、窓の銘柄を登録しても
-        # ティックは運ばれない。50枠と照会のAPI呼び出しを無駄に使うだけ
-        # なので、オプションの取得は楽天RSSに任せて何もしない。
-        # （このイベントは OptionMaster のチェーンが出すもので、休場中は
+        # 楽天RSSが全部を受け持つとき（kabus無効 / 休場）は、窓の銘柄を
+        # 登録してもティックは運ばれない。50枠と照会のAPI呼び出しを無駄に
+        # 使うだけなので、オプションの取得は楽天RSSに任せて何もしない。
+        # （このイベントは OptionMaster のチェーンが出すもので、そのときは
         #  楽天RSS経由の原資産価格で発火する。）
-        if getattr(self.gateway, "market_closed_mode", False):
+        if self.gateway.rss_only():
             return
 
         atm: AtmData = event.data
@@ -656,7 +712,7 @@ class KabusRestApi(RestClient):
         ので普通は登録が残らないが、モードを切り替えた直後の取りこぼしを
         防ぐため、ここでも見ておく。
         """
-        if getattr(self.gateway, "market_closed_mode", False):
+        if self.gateway.rss_only():
             return False
         return self.get_setting_from_symbol(symbol) in self.queried_symbol_settings
 
@@ -1847,11 +1903,24 @@ class RakutenRestApi(RestClient):
         # 登録をやり直した回数。無限に投げ直さないための歯止め。
         self.register_retry: dict = {}
         self.thread_symbol: threading.Thread = None
-        # self.gateway.event_engine.register(EVENT_ATM, self.process_atm_event)
+        # 限月ごとに、いま登録している行使価格。ATMが動いたら差分を取って、
+        # 増えたぶんを登録し、減ったぶんを解除する。
+        self.option_settings: dict = {}
+        # 楽天RSSが全部を受け持つときだけ働く（ハンドラの先頭で判定）。
+        self.gateway.event_engine.register(EVENT_ATM, self.process_atm_event)
         self.gateway.event_engine.register(EVENT_VI, self.process_vi_event)
 
     def process_atm_event(self, event) -> None:
-        """ATM价格变动事件处理"""
+        """ATM价格变动事件处理
+
+        kabus が動いているときは、窓の内側は kabus、外側だけを楽天RSSが
+        持つ（KabusRestApi._add_rss_option_settings が差分で面倒を見る）。
+        こちらが出ていくと二重に登録してしまうので、楽天RSSが全部を
+        受け持つときだけ動く。
+        """
+        if not self.gateway.rss_only():
+            return
+
         atm: AtmData = event.data
         print(f"[OK] rakuten process_atm_event: {atm}")
         atm_price: int = atm.atm_strike
@@ -1904,10 +1973,27 @@ class RakutenRestApi(RestClient):
         """
         if put_scope is None:
             put_scope = call_scope
+
+        # 今回欲しい銘柄の一覧。前回と比べて、増えたぶんを取りに行き、
+        # 減ったぶんは受信を止める。止めないと、ATMが動くたびに登録が
+        # 増え続け、アドインが2秒おきに流す行数がどんどん膨らむ。
+        wanted: set = set()
+        for strike_price in range(atm_price - 1000, atm_price + call_scope + 1, 1000):
+            wanted.add(f"{symbol_code}-{month}-C-{strike_price}")
+        for strike_price in range(atm_price + 1000, atm_price - put_scope - 1, -1000):
+            wanted.add(f"{symbol_code}-{month}-P-{strike_price}")
+
+        previous: set = self.option_settings.get(month, set())
+        self.option_settings[month] = wanted
+
+        for symbol_setting in sorted(previous - wanted):
+            self.release_symbol(symbol_setting, True)
+
         # 生成 call option symbol strike_price in range [atm_price, atm_price + call_scope] with interval 500
         for strike_price in range(atm_price - 1000, atm_price + call_scope + 1, 1000):
             symbol_setting = f"{symbol_code}-{month}-C-{strike_price}"
-            if symbol_setting not in self.queried_symbol_settings:
+            if (symbol_setting not in self.queried_symbol_settings
+                    and symbol_setting not in self.symbol_settings):
                 self.symbol_settings.append(symbol_setting)
             # # strike_price with interval 500
             # strike_price += 500
@@ -1918,7 +2004,8 @@ class RakutenRestApi(RestClient):
         # 生成 put option symbol strike_price in range [atm_price, atm_price - put_scope] with interval -500
         for strike_price in range(atm_price + 1000, atm_price - put_scope - 1, -1000):
             symbol_setting = f"{symbol_code}-{month}-P-{strike_price}"
-            if symbol_setting not in self.queried_symbol_settings:
+            if (symbol_setting not in self.queried_symbol_settings
+                    and symbol_setting not in self.symbol_settings):
                 self.symbol_settings.append(symbol_setting)
             # # strike_price with interval 500
             # strike_price -= 500
@@ -1951,7 +2038,9 @@ class RakutenRestApi(RestClient):
             int(datetime.now().strftime("%y%m%d%H%M%S")) * self.order_count
         )
 
-        if getattr(self.gateway, "market_closed_mode", False):
+        # 楽天RSSが全部を受け持つときは、先物もこちらで取りに行く
+        # （ふだんは kabus が先物を持っていて、ATMの基準もそちらから来る）。
+        if self.gateway.rss_only():
             for s in (f"{NK225_CODE}-{NK225_MONTH}", f"{NK225_CODE}-{NK225_MONTH2}"):
                 if s not in self.symbol_settings:
                     self.symbol_settings.insert(0, s)
@@ -2622,8 +2711,15 @@ class RakutenWebsocketApi(WebsocketClient):
             # 点差过大: 休場モードでは CurrentPrice を使用 (先物/オプション)
             if getattr(self.gateway, "market_closed_mode", False):
                 last_price = float(packet.get("CurrentPrice"))
+            elif self.gateway.rss_only():
+                # 楽天RSSしか供給元が無いので捨てない。捨てると次が来ず、
+                # 板の広い深いOTMの値がその時間ずっと止まったままになる。
+                # 下の加重中値で、広いなりの値を入れる。
+                pass
             else:
                 # 过滤点差过大的期权行情
+                # （kabus が同じ銘柄をもっと速いPUSHで送ってくるので、
+                #   ここで捨てても値は止まらない。）
                 contract: ContractData = symbol_contract_map.get(symbol, None)
                 if contract and contract.product == Product.OPTION:
                     return
